@@ -9,6 +9,8 @@ pub struct Settings {
     pub card_cols: u32,          // 卡片列数 2/3/4（列越少卡片越大）
     #[serde(default = "default_bg")]
     pub bg_color: u32,           // 卡片背景色 RGB（0xRRGGBB）
+    #[serde(default)]
+    pub autostart: bool,         // 开机自启（注册表 Run 键）
 }
 
 fn default_bg() -> u32 {
@@ -24,6 +26,7 @@ impl Default for Settings {
             show_icons: false,
             card_cols: 3,
             bg_color: 0x262A36,
+            autostart: false,
         }
     }
 }

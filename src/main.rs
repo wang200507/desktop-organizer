@@ -6,12 +6,20 @@ mod settings;
 use renderer::Renderer;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
 use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::*;
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ,
+};
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+use windows::Win32::UI::WindowsAndMessaging::{
+    MessageBoxW, IDYES, MB_YESNO,
+};
 use windows::Win32::UI::Shell::{
     ShellExecuteW, SHGetDesktopFolder, IShellFolder, IShellView, IContextMenu,
     SVGIO_BACKGROUND, CMF_NORMAL, CMINVOKECOMMANDINFO,
@@ -36,6 +44,8 @@ static EXPLORER_PID: AtomicU32 = AtomicU32::new(0);
 static MOUSE_HOOK: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 /// 菜单打开标志：TrackPopupMenu 模态循环期间钩子透传，避免误判双击/误弹菜单
 static MENU_OPEN: AtomicBool = AtomicBool::new(false);
+/// 卸载中标志：WM_DESTROY 跳过布局/设置保存（数据目录已被清理）
+static UNINSTALLING: AtomicBool = AtomicBool::new(false);
 
 /// 判断窗口是否属于"桌面区域"（我们的窗口 或 explorer 桌面层，排除任务栏/开始按钮/弹出菜单）
 fn is_desktop_area(hwnd_at: HWND) -> bool {
@@ -104,7 +114,6 @@ unsafe extern "system" fn ll_mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPAR
                                 layout::hit_test(&s.cards, pt.x, pt.y).is_some()
                             });
                             if !in_card {
-                                dbg_log(&format!("hook dblclick x={} y={}", pt.x, pt.y));
                                 let _ = PostMessageW(Some(HWND(main)), MSG_TOGGLE, WPARAM(0), LPARAM(0));
                             }
                         }
@@ -121,7 +130,6 @@ unsafe extern "system" fn ll_mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPAR
                         });
                         // 卡片区域右键由主窗口弹自定义菜单，这里不处理
                         if !in_card {
-                            dbg_log(&format!("hook rbuttonup x={} y={}", pt.x, pt.y));
                             let _ = PostMessageW(
                                 Some(HWND(main)),
                                 MSG_SYSMENU,
@@ -199,15 +207,15 @@ fn show_system_desktop_menu(hwnd: HWND, x: i32, y: i32) {
     unsafe {
         let desktop: IShellFolder = match SHGetDesktopFolder() {
             Ok(d) => d,
-            Err(e) => { dbg_log(&format!("SHGetDesktopFolder err={}", e)); return; }
+            Err(e) => { error_log(&format!("SHGetDesktopFolder err={}", e)); return; }
         };
         let view: IShellView = match desktop.CreateViewObject(hwnd) {
             Ok(v) => v,
-            Err(e) => { dbg_log(&format!("CreateViewObject err={}", e)); return; }
+            Err(e) => { error_log(&format!("CreateViewObject err={}", e)); return; }
         };
         let ctx: IContextMenu = match view.GetItemObject(SVGIO_BACKGROUND) {
             Ok(c) => c,
-            Err(e) => { dbg_log(&format!("GetItemObject err={}", e)); return; }
+            Err(e) => { error_log(&format!("GetItemObject err={}", e)); return; }
         };
         let menu = match CreatePopupMenu() {
             Ok(m) => m,
@@ -242,10 +250,92 @@ fn show_system_desktop_menu(hwnd: HWND, x: i32, y: i32) {
     }
 }
 
-fn dbg_log(msg: &str) {
+/// 数据目录：%LOCALAPPDATA%\DesktopOrganizer（layout/settings/error.log 统一存放，卸载时整体删除）
+fn data_dir() -> std::path::PathBuf {
+    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+    let dir = std::path::PathBuf::from(base).join("DesktopOrganizer");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// 错误日志：只记录错误（panic / Shell COM 失败等），写入数据目录 error.log
+fn error_log(msg: &str) {
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("debug.log") {
+    let path = data_dir().join("error.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "{}", msg);
+    }
+}
+
+/// 开机自启状态（注册表 HKCU\Software\Microsoft\Windows\CurrentVersion\Run\DesktopOrganizer）
+fn autostart_enabled() -> bool {
+    unsafe {
+        let key_path = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+        let mut hkey = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, key_path, None, KEY_QUERY_VALUE, &mut hkey).is_ok() {
+            let name = w!("DesktopOrganizer");
+            let mut cb: u32 = 0;
+            let r = RegQueryValueExW(hkey, name, None, None, None, Some(&mut cb));
+            RegCloseKey(hkey);
+            r.is_ok()
+        } else {
+            false
+        }
+    }
+}
+
+/// 设置开机自启：enabled=true 写 Run 键（exe 路径），false 删除
+fn set_autostart(enabled: bool) {
+    unsafe {
+        let key_path = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+        let mut hkey = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, key_path, None, KEY_SET_VALUE, &mut hkey).is_err() {
+            error_log("set_autostart: RegOpenKeyExW 失败");
+            return;
+        }
+        let name = w!("DesktopOrganizer");
+        if enabled {
+            if let Ok(exe) = std::env::current_exe() {
+                let s = format!("\"{}\"", exe.to_string_lossy());
+                let mut w: Vec<u16> = s.encode_utf16().collect();
+                w.push(0); // REG_SZ 需以 NUL 结尾
+                let bytes: &[u8] =
+                    std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 2);
+                let _ = RegSetValueExW(hkey, name, None, REG_SZ, Some(bytes));
+            }
+        } else {
+            let _ = RegDeleteValueW(hkey, name);
+        }
+        RegCloseKey(hkey);
+    }
+}
+
+/// 卸载：删自启键 + 还原桌面图标 + 清理数据目录 + 标记 exe 重启后自动删除
+fn uninstall() {
+    UNINSTALLING.store(true, Ordering::SeqCst);
+    set_autostart(false);
+    // 还原桌面图标（若程序正在接管中）
+    let dv = HIDDEN_DEFVIEW.swap(std::ptr::null_mut(), Ordering::SeqCst);
+    if !dv.is_null() {
+        unsafe {
+            let lv = HWND(dv);
+            ShowWindow(lv, SW_SHOW);
+            InvalidateRect(Some(lv), None, true);
+            UpdateWindow(lv);
+        }
+    }
+    // 清理数据目录（layout.json / settings.json / error.log）
+    let _ = std::fs::remove_dir_all(data_dir());
+    // 运行中的 exe 无法直接删除：标记重启后自动删除
+    if let Ok(exe) = std::env::current_exe() {
+        let s: Vec<u16> = exe.to_string_lossy().encode_utf16().collect();
+        unsafe {
+            let _ = MoveFileExW(
+                PCWSTR(s.as_ptr()),
+                PCWSTR(std::ptr::null()),
+                MOVEFILE_DELAY_UNTIL_REBOOT,
+            );
+        }
     }
 }
 
@@ -301,6 +391,8 @@ const MSG_SYSMENU: u32 = WM_APP + 1;
 const MSG_TOGGLE: u32 = WM_APP + 2;
 /// Win+D 兜底定时器 ID（每秒检查窗口可见性并恢复）
 const TIMER_ID: usize = 1;
+/// 菜单关闭后补渲染（菜单打开期间跳过 render，避免模态中移动窗口干扰菜单）
+const MSG_RENDER: u32 = WM_APP + 3;
 
 /// 双击检测：上次左键按下的时间/坐标（LL 钩子不报 DBLCLK，需自己判定）
 static LAST_DOWN: AtomicU32 = AtomicU32::new(0);
@@ -309,6 +401,11 @@ static LAST_DOWN_Y: AtomicI32 = AtomicI32::new(i32::MIN);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // 卸载入口：清理自启/数据目录/桌面接管状态，exe 标记重启后删除
+    if args.len() >= 2 && args[1] == "--uninstall" {
+        uninstall();
+        return;
+    }
     if args.len() >= 3 && args[1] == "--watchdog" {
         // Watchdog 模式：等待主进程退出（含任务管理器强杀），然后还原桌面图标
         let pid: u32 = args[2].parse().unwrap_or(0);
@@ -332,10 +429,10 @@ fn main() {
         }
         return;
     }
-    // 异常退出（panic）时兜底还原桌面图标，避免遗留图标隐藏状态
+    // 异常退出（panic）时兜底还原桌面图标 + 记录错误日志
     std::panic::set_hook(Box::new(|info| {
         restore_desktop_state();
-        eprintln!("desktop-organizer panic: {}", info);
+        error_log(&format!("panic: {}", info));
     }));
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -437,11 +534,9 @@ fn main() {
                 }
                 Err(_) => {}
             }
-            dbg_log(&format!("defview={:p}", defview.0));
             // 放到 WorkerW 之后（壁纸之上、正常窗口之下），不改变父子关系
             match GetParent(defview) {
                 Ok(workerw) => {
-                    dbg_log(&format!("workerw={:p} valid={}", workerw.0, !workerw.is_invalid()));
                     if !workerw.is_invalid() {
                         SetWindowPos(
                             hwnd,
@@ -454,10 +549,8 @@ fn main() {
                         );
                     }
                 }
-                Err(e) => dbg_log(&format!("GetParent err={}", e)),
+                Err(e) => error_log(&format!("GetParent err={}", e)),
             }
-        } else {
-            dbg_log("defview NOT found");
         }
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
@@ -505,9 +598,16 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             let mut cards = layout::classify(&items);
             let cw = unsafe { GetSystemMetrics(SM_CXSCREEN) };
             let ch = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-            let settings = settings::load_settings("settings.json");
+            let mut settings = settings::load_settings(
+                data_dir().join("settings.json").to_str().unwrap_or("settings.json"),
+            );
+            // 自启状态以注册表实际为准（避免设置文件与注册表不同步）
+            settings.autostart = autostart_enabled();
             layout::layout_cards(&mut cards, cw, ch, settings.card_cols as usize);
-            layout::load_layout(&mut cards, "layout.json");
+            {
+                let lp = data_dir().join("layout.json");
+                layout::load_layout(&mut cards, lp.to_str().unwrap_or("layout.json"));
+            }
             let mut renderer = Renderer::new();
             renderer.set_bg_color(settings.bg_color);
             let state = Box::new(State {
@@ -600,7 +700,18 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             }
             LRESULT(0)
         }
+        MSG_RENDER => {
+            // 菜单关闭后补渲染（菜单打开期间跳过 render，避免模态中移动窗口干扰菜单）
+            if let Some(s) = get_state(hwnd) {
+                s.renderer.render(hwnd, &s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+            }
+            LRESULT(0)
+        }
         WM_MOUSEWHEEL => {
+            // 菜单打开期间不处理滚轮（避免模态循环中渲染干扰菜单）
+            if MENU_OPEN.load(Ordering::SeqCst) {
+                return LRESULT(0);
+            }
             // 滚轮滚动列表（lParam 是屏幕坐标）
             let x = lparam_x(lp);
             let y = lparam_y(lp);
@@ -632,7 +743,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                                     CW_USEDEFAULT,
                                     CW_USEDEFAULT,
                                     340,
-                                    340,
+                                    440,
                                     None,
                                     None,
                                     Some(hinst.into()),
@@ -692,6 +803,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                             let _ = DestroyMenu(menu);
                         }
                         MENU_OPEN.store(false, Ordering::SeqCst);
+                        // 菜单期间可能有数据变更（删除/新建分区），补一帧渲染
+                        unsafe {
+                            let _ = PostMessageW(Some(hwnd), MSG_RENDER, WPARAM(0), LPARAM(0));
+                        }
                     }
                     None => {
                         // 桌面空白右键由全局鼠标钩子统一处理（弹系统原生菜单），这里不处理
@@ -733,7 +848,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                     let cw = unsafe { GetSystemMetrics(SM_CXSCREEN) };
                     let ch = unsafe { GetSystemMetrics(SM_CYSCREEN) };
                     layout::layout_cards(&mut s.cards, cw, ch, s.settings.card_cols as usize);
-                    s.renderer.render(hwnd, &s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+                    // 菜单可能还在模态循环中（WM_COMMAND 重入）：跳过 render，由 MSG_RENDER 在菜单关闭后补
+                    if !MENU_OPEN.load(Ordering::SeqCst) {
+                        s.renderer.render(hwnd, &s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+                    }
                 }
             }
             LRESULT(0)
@@ -742,7 +860,6 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             let (x, y) = lparam_to_screen(hwnd, lp);
             if let Some(s) = get_state(hwnd) {
                 if let Some(idx) = layout::hit_test_close(&s.cards, x, y) {
-                    dbg_log(&format!("down x={} y={} -> CLOSE idx={}", x, y, idx));
                     // 点击 X 删除分区
                     layout::remove_card(&mut s.cards, idx);
                     if s.cards.is_empty() {
@@ -755,7 +872,6 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                     layout::layout_cards(&mut s.cards, cw, ch, s.settings.card_cols as usize);
                     s.renderer.render(hwnd, &s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
                 } else if let Some(idx) = layout::hit_test_style(&s.cards, x, y) {
-                    dbg_log(&format!("down x={} y={} -> STYLE idx={}", x, y, idx));
                     // 点击样式切换按钮：网格/列表互切
                     s.cards[idx].style = match s.cards[idx].style {
                         CardStyle::Grid => CardStyle::List,
@@ -764,7 +880,6 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                     s.cards[idx].scroll = 0;
                     s.renderer.render(hwnd, &s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
                 } else if let Some((idx, kind)) = layout::hit_test_resize(&s.cards, x, y) {
-                    dbg_log(&format!("down x={} y={} -> RESIZE idx={} kind={:?}", x, y, idx, kind));
                     // 置顶：把该卡片移到数组末尾（z-order 上层），避免被其他卡片盖住
                     let card = s.cards.remove(idx);
                     s.cards.push(card);
@@ -788,11 +903,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                     });
                     unsafe { SetCapture(hwnd); }
                 } else if let Some((ci, ii)) = layout::hit_test_item(&s.cards, x, y, s.settings.show_icons) {
-                    dbg_log(&format!("down x={} y={} -> ITEM ci={} ii={}", x, y, ci, ii));
                     // 单击选中图标项（渲染延迟到 UP，避免双击时重复渲染拖慢打开）
                     s.selected = Some((ci, ii));
                 } else if let Some(idx) = layout::hit_test_title(&s.cards, x, y) {
-                    dbg_log(&format!("down x={} y={} -> TITLE idx={}", x, y, idx));
                     // 置顶：把该卡片移到数组末尾（z-order 上层），避免被其他卡片盖住
                     let card = s.cards.remove(idx);
                     s.cards.push(card);
@@ -907,9 +1020,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
         }
         WM_DESTROY => {
             unsafe { let _ = KillTimer(Some(hwnd), TIMER_ID); }
-            if let Some(s) = get_state(hwnd) {
-                layout::save_layout(&s.cards, "layout.json");
-                settings::save_settings(&s.settings, "settings.json");
+            if !UNINSTALLING.load(Ordering::SeqCst) {
+                if let Some(s) = get_state(hwnd) {
+                    let lp = data_dir().join("layout.json");
+                    layout::save_layout(&s.cards, lp.to_str().unwrap_or("layout.json"));
+                    let sp = data_dir().join("settings.json");
+                    settings::save_settings(&s.settings, sp.to_str().unwrap_or("settings.json"));
+                }
             }
             // 还原桌面图标列表 + 卸载钩子
             restore_desktop_state();
@@ -983,9 +1100,34 @@ extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                         _ => 0x262A36,
                     };
                     changed = true;
+                } else if y >= 286 && y < 332 {
+                    // 开机自启开关（写/删注册表 Run 键）
+                    state.settings.autostart = !state.settings.autostart;
+                    set_autostart(state.settings.autostart);
+                    changed = true;
+                } else if y >= 332 && y < 378 {
+                    // 卸载程序：确认后清理并退出
+                    let msg_w: Vec<u16> = "确定要卸载吗？\n将删除：开机自启、数据目录（布局/设置/日志）。\n程序 exe 将在重启系统后自动删除。".encode_utf16().collect();
+                    let cap_w: Vec<u16> = "卸载确认".encode_utf16().collect();
+                    let ret = unsafe {
+                        MessageBoxW(
+                            Some(hwnd),
+                            PCWSTR(msg_w.as_ptr()),
+                            PCWSTR(cap_w.as_ptr()),
+                            MB_YESNO,
+                        )
+                    };
+                    if ret == IDYES {
+                        uninstall();
+                        let main = state.main_hwnd;
+                        unsafe { DestroyWindow(hwnd) };
+                        unsafe { DestroyWindow(main) };
+                        return LRESULT(0);
+                    }
                 }
                 if changed {
-                    settings::save_settings(&state.settings, "settings.json");
+                    let sp = data_dir().join("settings.json");
+                    settings::save_settings(&state.settings, sp.to_str().unwrap_or("settings.json"));
                     if let Some(s) = get_state(state.main_hwnd) {
                         let cols_changed = s.settings.card_cols != state.settings.card_cols;
                         let bg_changed = s.settings.bg_color != state.settings.bg_color;
@@ -1047,13 +1189,15 @@ fn draw_settings(hwnd: HWND, settings: &settings::Settings) {
         let old_font = SelectObject(hdc, font.into());
 
         // 扁平风格：每行一个白色圆角块，标签左侧、值右侧蓝色
-        let rows: [(&str, String); 6] = [
+        let rows: [(&str, String); 8] = [
             ("卡片透明度", settings.alpha.to_string()),
             ("双击隐藏", if settings.double_click_hide { "开".into() } else { "关".into() }),
             ("自动分类", if settings.auto_classify { "开".into() } else { "关".into() }),
             ("显示格式", if settings.show_icons { "图标".into() } else { "名称".into() }),
             ("卡片大小", match settings.card_cols { 2 => "大".into(), 4 => "小".into(), _ => "中".into() }),
             ("背景色", format!("#{:06X}", settings.bg_color)),
+            ("开机自启", if settings.autostart { "开".into() } else { "关".into() }),
+            ("卸载程序", "点击卸载".into()),
         ];
         let row_h = 46;
         let margin = 10;
