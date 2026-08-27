@@ -4,6 +4,14 @@
 
 **核心卖点：极低内存** —— 常驻私有内存约 **9MB**，exe 仅约 **200KB**，后台运行几乎无感。
 
+## 下载
+
+最新版可执行文件（Windows 10/11 x64，免安装）：
+
+[⬇️ 下载 desktop-organizer.exe](https://github.com/wang200507/desktop-organizer/releases/latest/download/desktop-organizer.exe)
+
+> 首次运行 Windows SmartScreen 可能提示拦截（未数字签名），点「更多信息 → 仍要运行」即可。
+
 ## 功能特性
 
 | 功能 | 说明 |
