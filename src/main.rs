@@ -107,11 +107,11 @@ unsafe extern "system" fn ll_mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPAR
                 if is_desktop_area(WindowFromPoint(pt)) {
                     let dbl = GetDoubleClickTime() as u32;
                     if last != 0 && t.wrapping_sub(last) < dbl && dx.abs() <= 4 && dy.abs() <= 4 {
-                        // 双击：不在卡片内 → 切换桌面可见性
+                        // 双击：不在卡片内 → 切换桌面可见性（隐藏态下卡片不可见，视为全部空白）
                         let main = MAIN_HWND.load(Ordering::SeqCst);
                         if !main.is_null() {
                             let in_card = get_state(HWND(main)).map_or(false, |s| {
-                                layout::hit_test(&s.cards, pt.x, pt.y).is_some()
+                                s.visible && layout::hit_test(&s.cards, pt.x, pt.y).is_some()
                             });
                             if !in_card {
                                 let _ = PostMessageW(Some(HWND(main)), MSG_TOGGLE, WPARAM(0), LPARAM(0));
@@ -125,8 +125,9 @@ unsafe extern "system" fn ll_mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPAR
                 if is_desktop_area(WindowFromPoint(pt)) {
                     let main = MAIN_HWND.load(Ordering::SeqCst);
                     if !main.is_null() {
+                        // 隐藏态下卡片不可见：整个桌面都视为空白，右键一律弹系统菜单
                         let in_card = get_state(HWND(main)).map_or(false, |s| {
-                            layout::hit_test(&s.cards, pt.x, pt.y).is_some()
+                            s.visible && layout::hit_test(&s.cards, pt.x, pt.y).is_some()
                         });
                         // 卡片区域右键由主窗口弹自定义菜单，这里不处理
                         if !in_card {
@@ -225,6 +226,8 @@ fn show_system_desktop_menu(hwnd: HWND, x: i32, y: i32) {
         const CMD_LAST: u32 = 0x7fff;
         let hr = ctx.QueryContextMenu(menu, 0, CMD_FIRST, CMD_LAST, CMF_NORMAL);
         if hr.is_ok() {
+            // 模态菜单期间置 MENU_OPEN：钩子完全透传，避免菜单点击被误判双击/拦截（与卡片菜单一致）
+            MENU_OPEN.store(true, Ordering::SeqCst);
             // TPM_RETURNCMD：菜单选中的命令 ID 作为返回值；TPM_NONOTIFY：不发送 WM_COMMAND，自己 InvokeCommand
             let cmd = TrackPopupMenu(
                 menu,
@@ -245,6 +248,7 @@ fn show_system_desktop_menu(hwnd: HWND, x: i32, y: i32) {
                 ici.nShow = SW_SHOWNORMAL.0;
                 let _ = ctx.InvokeCommand(&ici);
             }
+            MENU_OPEN.store(false, Ordering::SeqCst);
         }
         let _ = DestroyMenu(menu);
     }
@@ -556,7 +560,7 @@ fn main() {
         UpdateWindow(hwnd);
         // 显式首次渲染（分层窗口不走 WM_PAINT，避免重启后空白需点击才出现）
         if let Some(s) = get_state(hwnd) {
-            s.renderer.render(hwnd, &s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+            s.renderer.render(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
         }
     }
 
@@ -640,16 +644,20 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             let mut pt = POINT::default();
             unsafe { GetCursorPos(&mut pt); }
             if let Some(s) = get_state(hwnd) {
-                if let Some((_, kind)) = layout::hit_test_resize(&s.cards, pt.x, pt.y) {
-                    let cursor_id = match kind {
-                        layout::ResizeKind::Right => IDC_SIZEWE,
-                        layout::ResizeKind::Bottom => IDC_SIZENS,
-                        layout::ResizeKind::Corner => IDC_SIZENWSE,
-                    };
-                    if let Ok(cursor) = unsafe { LoadCursorW(None, cursor_id) } {
-                        unsafe { SetCursor(Some(cursor)); }
+                // 拖拽调整中或悬停在卡片边缘时才切换光标（隐藏态不响应）
+                let active = s.visible && (s.drag.is_some() || layout::hit_test_resize(&s.cards, pt.x, pt.y).is_some());
+                if active {
+                    if let Some((_, kind)) = layout::hit_test_resize(&s.cards, pt.x, pt.y) {
+                        let cursor_id = match kind {
+                            layout::ResizeKind::Right => IDC_SIZEWE,
+                            layout::ResizeKind::Bottom => IDC_SIZENS,
+                            layout::ResizeKind::Corner => IDC_SIZENWSE,
+                        };
+                        if let Ok(cursor) = unsafe { LoadCursorW(None, cursor_id) } {
+                            unsafe { SetCursor(Some(cursor)); }
+                        }
+                        return LRESULT(1);
                     }
-                    return LRESULT(1);
                 }
             }
             unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
@@ -657,6 +665,14 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
         WM_LBUTTONDBLCLK => {
             let (x, y) = lparam_to_screen(hwnd, lp);
             if let Some(s) = get_state(hwnd) {
+                // 隐藏态：双击提示卡恢复显示（此时不可与隐形卡片交互）
+                if !s.visible {
+                    if s.settings.double_click_hide {
+                        s.visible = true;
+                        s.renderer.render(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+                    }
+                    return LRESULT(0);
+                }
                 // 双击图标项 → 打开文件/快捷方式
                 if let Some((ci, ii)) = layout::hit_test_item(&s.cards, x, y, s.settings.show_icons) {
                     if let Some(card) = s.cards.get(ci) {
@@ -680,7 +696,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                 } else if s.settings.double_click_hide && layout::hit_test(&s.cards, x, y).is_none() {
                     // 双击卡片外空白 → 隐藏/显示
                     s.visible = !s.visible;
-                    s.renderer.render(hwnd, &s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+                    s.renderer.render(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
                 }
             }
             LRESULT(0)
@@ -696,14 +712,14 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             // 钩子检测到双击桌面空白 → 切换可见性（隐藏/显示卡片）
             if let Some(s) = get_state(hwnd) {
                 s.visible = !s.visible;
-                s.renderer.render(hwnd, &s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+                s.renderer.render(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
             }
             LRESULT(0)
         }
         MSG_RENDER => {
             // 菜单关闭后补渲染（菜单打开期间跳过 render，避免模态中移动窗口干扰菜单）
             if let Some(s) = get_state(hwnd) {
-                s.renderer.render(hwnd, &s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+                s.renderer.render(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
             }
             LRESULT(0)
         }
@@ -717,12 +733,18 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             let y = lparam_y(lp);
             let delta = ((wp.0 as u32 >> 16) & 0xffff) as u16 as i16;
             if let Some(s) = get_state(hwnd) {
+                if !s.visible {
+                    return LRESULT(0);
+                }
                 if let Some(idx) = layout::hit_test(&s.cards, x, y) {
-                    if let Some(card) = s.cards.get_mut(idx) {
+                    let rect = {
+                        let Some(card) = s.cards.get_mut(idx) else { return LRESULT(0) };
                         // 网格/列表都支持滚轮滚动
                         card.scroll -= (delta / 120) as i32; // 上滚负数方向调整
-                        s.renderer.render(hwnd, &s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
-                    }
+                        (card.x, card.y, card.x + card.width, card.y + card.height)
+                    };
+                    // 局部渲染：仅重绘该卡片，避免整屏重绘卡顿
+                    s.renderer.render_damage(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected, &[rect]);
                 }
             }
             LRESULT(0)
@@ -770,7 +792,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                         let cw = unsafe { GetSystemMetrics(SM_CXSCREEN) };
                         let ch = unsafe { GetSystemMetrics(SM_CYSCREEN) };
                         layout::layout_cards(&mut s.cards, cw, ch, s.settings.card_cols as usize);
-                        s.renderer.render(hwnd, &s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+                        s.renderer.render(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
                     }
                 }
                 0x1B => {
@@ -784,6 +806,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
         WM_RBUTTONUP => {
             let (x, y) = lparam_to_screen(hwnd, lp);
             if let Some(s) = get_state(hwnd) {
+                // 隐藏态不弹卡片菜单（桌面空白右键由全局钩子弹系统菜单）
+                if !s.visible {
+                    return LRESULT(0);
+                }
                 let idx = layout::hit_test(&s.cards, x, y);
                 s.menu_card = idx;
                 match idx {
@@ -822,11 +848,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                 match cmd {
                     CMD_DELETE => {
                         if let Some(idx) = s.menu_card {
+                            // 直接移除，其他卡片位置保持不动（不再整体重排）
                             layout::remove_card(&mut s.cards, idx);
                             changed = true;
                         }
                     }
                     CMD_NEW => {
+                        // 新卡片自动找空位插入，不影响现有布局
                         layout::add_card(&mut s.cards);
                         changed = true;
                     }
@@ -845,12 +873,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                 }
                 s.menu_card = None;
                 if changed {
-                    let cw = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-                    let ch = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-                    layout::layout_cards(&mut s.cards, cw, ch, s.settings.card_cols as usize);
                     // 菜单可能还在模态循环中（WM_COMMAND 重入）：跳过 render，由 MSG_RENDER 在菜单关闭后补
                     if !MENU_OPEN.load(Ordering::SeqCst) {
-                        s.renderer.render(hwnd, &s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+                        s.renderer.render(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
                     }
                 }
             }
@@ -859,26 +884,30 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
         WM_LBUTTONDOWN => {
             let (x, y) = lparam_to_screen(hwnd, lp);
             if let Some(s) = get_state(hwnd) {
+                // 隐藏态不与隐形卡片交互（提示卡仅响应双击恢复）
+                if !s.visible {
+                    return LRESULT(0);
+                }
                 if let Some(idx) = layout::hit_test_close(&s.cards, x, y) {
-                    // 点击 X 删除分区
+                    // 点击 X 删除分区（其余卡片位置保持不动）
                     layout::remove_card(&mut s.cards, idx);
                     if s.cards.is_empty() {
                         // 无卡片：还原原生桌面并退出
                         unsafe { DestroyWindow(hwnd) };
                         return LRESULT(0);
                     }
-                    let cw = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-                    let ch = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-                    layout::layout_cards(&mut s.cards, cw, ch, s.settings.card_cols as usize);
-                    s.renderer.render(hwnd, &s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+                    s.selected = None;
+                    s.renderer.render(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
                 } else if let Some(idx) = layout::hit_test_style(&s.cards, x, y) {
-                    // 点击样式切换按钮：网格/列表互切
+                    // 点击样式切换按钮：网格/列表互切（局部重绘该卡片）
                     s.cards[idx].style = match s.cards[idx].style {
                         CardStyle::Grid => CardStyle::List,
                         CardStyle::List => CardStyle::Grid,
                     };
                     s.cards[idx].scroll = 0;
-                    s.renderer.render(hwnd, &s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+                    let card = &s.cards[idx];
+                    let rect = (card.x, card.y, card.x + card.width, card.y + card.height);
+                    s.renderer.render_damage(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected, &[rect]);
                 } else if let Some((idx, kind)) = layout::hit_test_resize(&s.cards, x, y) {
                     // 置顶：把该卡片移到数组末尾（z-order 上层），避免被其他卡片盖住
                     let card = s.cards.remove(idx);
@@ -903,8 +932,21 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                     });
                     unsafe { SetCapture(hwnd); }
                 } else if let Some((ci, ii)) = layout::hit_test_item(&s.cards, x, y, s.settings.show_icons) {
-                    // 单击选中图标项（渲染延迟到 UP，避免双击时重复渲染拖慢打开）
+                    // 单击选中图标项：仅局部重绘新旧选中卡片
+                    let old = s.selected;
                     s.selected = Some((ci, ii));
+                    if old != s.selected {
+                        let mut rects: Vec<(i32, i32, i32, i32)> = Vec::new();
+                        if let Some((oci, _)) = old {
+                            if let Some(c) = s.cards.get(oci) {
+                                rects.push((c.x, c.y, c.x + c.width, c.y + c.height));
+                            }
+                        }
+                        if let Some(c) = s.cards.get(ci) {
+                            rects.push((c.x, c.y, c.x + c.width, c.y + c.height));
+                        }
+                        s.renderer.render_damage(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected, &rects);
+                    }
                 } else if let Some(idx) = layout::hit_test_title(&s.cards, x, y) {
                     // 置顶：把该卡片移到数组末尾（z-order 上层），避免被其他卡片盖住
                     let card = s.cards.remove(idx);
@@ -923,6 +965,15 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                         start_h: 0,
                     });
                     unsafe { SetCapture(hwnd); }
+                } else if s.selected.is_some() {
+                    // 点击空白：取消选中（局部重绘原卡片）
+                    let old = s.selected.take();
+                    if let Some((oci, _)) = old {
+                        if let Some(c) = s.cards.get(oci) {
+                            let rect = (c.x, c.y, c.x + c.width, c.y + c.height);
+                            s.renderer.render_damage(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected, &[rect]);
+                        }
+                    }
                 }
             }
             LRESULT(0)
@@ -930,12 +981,21 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
         WM_MOUSEMOVE => {
             let (x, y) = lparam_to_screen(hwnd, lp);
             if let Some(s) = get_state(hwnd) {
+                if !s.visible {
+                    return LRESULT(0);
+                }
                 if let Some(drag) = &s.drag {
                     let idx = drag.card_index;
                     const MIN_W: i32 = 120;
                     const MIN_H: i32 = 80;
                     const MAX_W: i32 = 640;
                     const MAX_H: i32 = 420;
+                    let old_rect = (
+                        s.cards[idx].x,
+                        s.cards[idx].y,
+                        s.cards[idx].x + s.cards[idx].width,
+                        s.cards[idx].y + s.cards[idx].height,
+                    );
                     match drag.mode {
                         DragMode::Move => {
                             let cw = s.cards[idx].width;
@@ -961,9 +1021,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                             s.cards[idx].height = nh;
                         }
                     }
+                    // 节流 + 局部渲染：只清空/重绘拖拽卡片的新旧区域，
+                    // 不再做整屏 memset + 全量重绘（卡顿根因）
                     if s.last_render.elapsed().as_millis() >= 16 {
                         s.last_render = std::time::Instant::now();
-                        s.renderer.render(hwnd, &s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+                        let c = &s.cards[idx];
+                        let new_rect = (c.x, c.y, c.x + c.width, c.y + c.height);
+                        s.renderer.render_damage(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected, &[old_rect, new_rect]);
                     }
                 }
             }
@@ -972,8 +1036,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
         WM_LBUTTONUP => {
             unsafe { ReleaseCapture(); }
             if let Some(s) = get_state(hwnd) {
-                s.drag = None;
-                s.renderer.render(hwnd, &s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+                if s.drag.is_some() {
+                    // 拖拽结束：补一帧全量（一次性开销，确保最终状态正确）
+                    s.drag = None;
+                    s.renderer.render(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+                }
             }
             LRESULT(0)
         }
@@ -1140,7 +1207,7 @@ extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                         if bg_changed {
                             s.renderer.set_bg_color(s.settings.bg_color);
                         }
-                        s.renderer.render(state.main_hwnd, &s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+                        s.renderer.render(state.main_hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
                     }
                     unsafe { InvalidateRect(Some(hwnd), None, true) };
                 }

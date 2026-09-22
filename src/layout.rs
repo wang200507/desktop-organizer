@@ -1,6 +1,14 @@
 use crate::scanner::{DesktopItem, IconKind};
 use serde::{Deserialize, Serialize};
 
+/// 标题栏高度（与 renderer.rs 保持一致）
+pub const TITLE_H: i32 = 36;
+/// 内容区顶部（标题栏 + 分隔线以下）
+pub const CONTENT_TOP: i32 = 42;
+/// 网格单元尺寸
+pub const CELL_W: i32 = 96;
+pub const CELL_H: i32 = 74;
+
 /// 卡片内容显示样式
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub enum CardStyle {
@@ -134,24 +142,22 @@ pub fn hit_test_resize(cards: &[Card], x: i32, y: i32) -> Option<(usize, ResizeK
 pub fn hit_test_item(cards: &[Card], x: i32, y: i32, show_icons: bool) -> Option<(usize, usize)> {
     for (ci, card) in cards.iter().enumerate().rev() {
         // 内容区（避开右侧按钮区）
-        if x < card.x + 8 || x >= card.x + card.width - 28 || y < card.y + 40 {
+        if x < card.x + 8 || x >= card.x + card.width - 28 || y < card.y + CONTENT_TOP {
             continue;
         }
         match card.style {
             CardStyle::Grid => {
-                let cell_w = 100;
-                let cell_h = 72;
-                let cols = ((card.width - 16) / cell_w).max(1);
-                let col = (x - card.x - 8) / cell_w;
-                let row = (y - card.y - 40) / cell_h;
+                let cols = ((card.width - 16) / CELL_W).max(1);
+                let col = (x - card.x - 8) / CELL_W;
+                let row = (y - card.y - CONTENT_TOP) / CELL_H;
                 let idx = ((row + card.scroll) * cols + col) as usize;
                 if idx < card.item_indices.len() {
                     return Some((ci, idx));
                 }
             }
             CardStyle::List => {
-                let row_h = if show_icons { 24 } else { 20 };
-                let mut y_pos = card.y + 40;
+                let row_h = if show_icons { 26 } else { 22 };
+                let mut y_pos = card.y + CONTENT_TOP;
                 for (ii, _) in card.item_indices.iter().enumerate() {
                     if y >= y_pos && y < y_pos + row_h {
                         return Some((ci, ii));
@@ -179,25 +185,12 @@ pub fn hit_test_style(cards: &[Card], x: i32, y: i32) -> Option<usize> {
 /// 命中测试：判断坐标是否落在卡片标题栏（用于拖动移动）
 pub fn hit_test_title(cards: &[Card], x: i32, y: i32) -> Option<usize> {
     for (i, card) in cards.iter().enumerate().rev() {
-        // 标题栏区域：卡片顶部 36px，避开右侧 X 按钮
-        if x >= card.x && x < card.x + card.width - 28 && y >= card.y && y < card.y + 36 {
+        // 标题栏区域：卡片顶部 TITLE_H 像素，避开右侧按钮区
+        if x >= card.x && x < card.x + card.width - 28 && y >= card.y && y < card.y + TITLE_H {
             return Some(i);
         }
     }
     None
-}
-
-/// 检测卡片 idx 的新矩形是否与其他卡片重叠（用于禁止卡片重叠）
-pub fn overlaps(cards: &[Card], idx: usize, x: i32, y: i32, w: i32, h: i32) -> bool {
-    for (i, card) in cards.iter().enumerate() {
-        if i == idx {
-            continue;
-        }
-        if x < card.x + card.width && x + w > card.x && y < card.y + card.height && y + h > card.y {
-            return true;
-        }
-    }
-    false
 }
 
 #[derive(Serialize, Deserialize)]
@@ -270,8 +263,35 @@ pub fn remove_card(cards: &mut Vec<Card>, index: usize) {
     }
 }
 
-/// 新建空分区
+/// 新建空分区：自动寻找不与现有卡片重叠的空位（不再重置其他卡片布局）
 pub fn add_card(cards: &mut Vec<Card>) {
     let n = cards.iter().filter(|c| c.title.starts_with("新分区")).count() + 1;
-    cards.push(Card::new(IconKind::Other, &format!("新分区{}", n)));
+    let mut card = Card::new(IconKind::Other, &format!("新分区{}", n));
+    card.width = 260;
+    card.height = 200;
+    let (cw, ch) = (260, 200);
+    let margin = 16;
+    let gap = 16;
+    let mut placed = false;
+    'outer: for row in 0..12 {
+        for col in 0..12 {
+            let x = margin + col * (cw + gap);
+            let y = margin + row * (ch + gap);
+            let overlap = cards
+                .iter()
+                .any(|c| x < c.x + c.width && x + cw > c.x && y < c.y + c.height && y + ch > c.y);
+            if !overlap {
+                card.x = x;
+                card.y = y;
+                placed = true;
+                break 'outer;
+            }
+        }
+    }
+    if !placed {
+        // 兜底：级联偏移
+        card.x = margin + ((cards.len() * 28) % 500) as i32;
+        card.y = margin + ((cards.len() * 28) % 400) as i32;
+    }
+    cards.push(card);
 }

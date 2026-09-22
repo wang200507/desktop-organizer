@@ -3,7 +3,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, WIN32_FIND_DATAW};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER, IPersistFile, STGM};
 use windows::Win32::UI::Shell::{
-    SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON, IShellLinkW,
+    SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, IShellLinkW,
 };
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 
@@ -94,7 +94,7 @@ fn public_desktop() -> PathBuf {
     PathBuf::from(public).join("Desktop")
 }
 
-/// 用 SHGetFileInfo 获取文件小图标（16x16）；.lnk 先解析目标取真实图标（去快捷方式箭头）
+/// 用 SHGetFileInfo 获取文件大图标（32x32，网格模式清晰显示）；.lnk 先解析目标取真实图标（去快捷方式箭头）
 fn load_icon(path: &PathBuf) -> Option<HICON> {
     // .lnk 解析目标路径（失败则回退用 .lnk 自身）
     let icon_path = if path.extension().map_or(false, |e| e.eq_ignore_ascii_case("lnk")) {
@@ -111,7 +111,7 @@ fn load_icon(path: &PathBuf) -> Option<HICON> {
             FILE_FLAGS_AND_ATTRIBUTES(0),
             Some(&mut sfi),
             std::mem::size_of::<SHFILEINFOW>() as u32,
-            SHGFI_ICON | SHGFI_SMALLICON,
+            SHGFI_ICON | SHGFI_LARGEICON,
         );
     }
     if sfi.hIcon.is_invalid() {
