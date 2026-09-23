@@ -409,46 +409,69 @@ impl Renderer {
             let grid_font = make_font(grid_pt, false);
             let item_font = make_font(item_pt, false);
 
-            // 左侧强调圆点
-            let (dr, dg, db) = (86, 156, 214);
-            let dot_brush = CreateSolidBrush(rgb(dr, dg, db));
-            let dot_old_pen = SelectObject(mem_dc, GetStockObject(NULL_PEN));
-            let _ = Ellipse(
+            // 标题栏图标：圆角应用块 + 分区首字符（替代原圆点，更清晰）
+            let tile = (18.0 * s) as i32;
+            let tile_top = y + (th - tile).max(0) / 2;
+            let tpen = CreatePen(PS_NULL, 0, rgb(0, 0, 0));
+            let tbr = CreateSolidBrush(rgb(86, 156, 214));
+            let tpo = SelectObject(mem_dc, tpen.into());
+            let tbo = SelectObject(mem_dc, tbr.into());
+            let _ = RoundRect(
                 mem_dc,
-                x + (14.0 * s) as i32, y + (13.0 * s) as i32,
-                x + (22.0 * s) as i32, y + (21.0 * s) as i32,
+                x + (12.0 * s) as i32, tile_top,
+                x + (12.0 * s) as i32 + tile, tile_top + tile,
+                (6.0 * s) as i32, (6.0 * s) as i32,
             );
-            SelectObject(mem_dc, dot_old_pen);
-            DeleteObject(dot_brush.into());
+            SelectObject(mem_dc, tbo);
+            SelectObject(mem_dc, tpo);
+            DeleteObject(tbr.into());
+            DeleteObject(tpen.into());
+            let first_c: Vec<u16> = card.title.chars().next().unwrap_or('□').to_string().encode_utf16().collect();
+            let chip_font = make_font(((11.0 * s).max(8.0)) as i32, true);
+            let cf_old = SelectObject(mem_dc, chip_font.into());
+            SetBkMode(mem_dc, TRANSPARENT);
+            SetTextColor(mem_dc, rgb(255, 255, 255));
+            {
+                let mut fab = SIZE::default();
+                GetTextExtentPoint32W(mem_dc, &first_c, &mut fab);
+                TextOutW(mem_dc, x + (12.0 * s) as i32 + (tile - fab.cx) / 2, tile_top + (tile - fab.cy) / 2, &first_c);
+            }
+            SelectObject(mem_dc, cf_old);
+            DeleteObject(chip_font.into());
 
-            // 标题（左对齐，随卡片缩放字号）
+            // 统一垂直基线：以 title 带高 th 为中轴，各元素按参考字高居中
+            let title_ref = (17.0 * s) as i32; // 标题字形参考高
+            let base_top = y + ((th - title_ref) / 2).max(0);
+            let title_left = x + (12.0 * s) as i32 + tile + (10.0 * s) as i32;
+            let cnt_ref = (12.0 * s) as i32; // 数量徽标参考高
+            let cnt_top = y + ((th - cnt_ref) / 2).max(0);
+
+            // 标题（左对齐，垂直居中）
             let old_font = SelectObject(mem_dc, title_font.into());
+            SetBkMode(mem_dc, TRANSPARENT);
             SetTextColor(mem_dc, rgb(238, 240, 246));
             let title: Vec<u16> = card.title.encode_utf16().collect();
-            TextOutW(mem_dc, x + (28.0 * s) as i32, y + (10.0 * s) as i32, &title);
+            TextOutW(mem_dc, title_left, base_top, &title);
 
-            // 数量徽标（小号灰字，右对齐到按钮区左侧）
-            let g_old = SelectObject(mem_dc, grid_font.into());
-            SetTextColor(mem_dc, rgb(150, 158, 175));
-            let cnt = card.item_indices.len().to_string();
-            let cw16: Vec<u16> = cnt.encode_utf16().collect();
-            let mut sz = SIZE::default();
-            GetTextExtentPoint32W(mem_dc, &cw16, &mut sz);
-            TextOutW(mem_dc, (right - (78.0 * s) as i32 - sz.cx).max(x + (30.0 * s) as i32), y + (14.0 * s) as i32, &cw16);
-            SelectObject(mem_dc, g_old);
-
-            // 右上角 X 按钮
+            // 右上动作区（同一基线垂直居中）：关闭 ✕ 与样式切换图标
             SetTextColor(mem_dc, rgb(196, 132, 134));
             let x_w: Vec<u16> = "✕".encode_utf16().collect();
-            TextOutW(mem_dc, right - (26.0 * s) as i32, y + (7.0 * s) as i32, &x_w);
-
-            // 样式切换按钮（X 左侧）：List 显示 ▦（点它切网格），Grid 显示 ≡（点它切列表）
+            TextOutW(mem_dc, right - (26.0 * s) as i32, base_top, &x_w);
             SetTextColor(mem_dc, rgb(152, 164, 188));
             let style_icon: Vec<u16> = match card.style {
                 CardStyle::Grid => "≡".encode_utf16().collect(),
                 CardStyle::List => "▦".encode_utf16().collect(),
             };
-            TextOutW(mem_dc, right - (54.0 * s) as i32, y + (7.0 * s) as i32, &style_icon);
+            TextOutW(mem_dc, right - (54.0 * s) as i32, base_top, &style_icon);
+
+            // 数量徽标（右对齐到动作区左侧，独立垂直居中，小号灰字）
+            SelectObject(mem_dc, grid_font.into());
+            SetTextColor(mem_dc, rgb(150, 158, 175));
+            let cnt = card.item_indices.len().to_string();
+            let cw16: Vec<u16> = cnt.encode_utf16().collect();
+            let mut sz = SIZE::default();
+            GetTextExtentPoint32W(mem_dc, &cw16, &mut sz);
+            TextOutW(mem_dc, (right - (78.0 * s) as i32 - sz.cx).max(title_left + (8.0 * s) as i32), cnt_top, &cw16);
             SelectObject(mem_dc, old_font);
 
             // 内容区（随卡片缩放）
