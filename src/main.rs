@@ -210,6 +210,7 @@ extern "system" {
     fn SetCapture(hwnd: HWND) -> HWND;
     fn ReleaseCapture() -> i32;
     fn SetFocus(hwnd: HWND) -> HWND;
+    fn IsIconic(hwnd: HWND) -> windows::Win32::Foundation::BOOL;
 }
 
 /// 用 Shell COM 接口弹出系统原生桌面右键菜单（查看/排序/刷新/新建/显示设置/个性化等）
@@ -1095,10 +1096,22 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             }
             LRESULT(0)
         }
+        WM_SYSCOMMAND => {
+            // 拦截最小化（Win+D 显示桌面/手动最小化）：卡片保持常显
+            let cmd = (wp.0 as usize) & 0xFFF0;
+            if cmd == 0xF020 {
+                // SC_MINIMIZE
+                return LRESULT(0);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
         WM_TIMER => {
-            // 兜底：Win+D 等系统隐藏后自动恢复可见（每秒检查一次，开销极小）
+            // 兜底：Win+D 等系统隐藏/最小化后自动恢复可见（每秒检查一次，开销极小）
             if wp.0 == TIMER_ID {
-                if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+                // 最小化窗口 IsWindowVisible 仍为 TRUE，须额外判 IsIconic
+                if unsafe { IsIconic(hwnd).as_bool() } {
+                    unsafe { ShowWindow(hwnd, SW_RESTORE) };
+                } else if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
                     unsafe { ShowWindow(hwnd, SW_SHOW) };
                 }
             }

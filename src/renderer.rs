@@ -373,6 +373,12 @@ impl Renderer {
             let th = title_h(card.width).max(24);
             let ct = content_top(card.width);
 
+            // 圆角裁剪区：将卡片背景与内容(GDI 图标/文字/填充)裁剪到圆角形状内，
+            // 杜绝四个角的内容溢出与内容锯齿（只有 blend_cards 描边环在圆角外沿过渡）
+            let _ = SelectClipRgn(mem_dc, None);
+            let card_rgn = CreateRoundRectRgn(x, y, right, bottom, CARD_RADIUS * 2, CARD_RADIUS * 2);
+            SelectClipRgn(mem_dc, Some(card_rgn));
+
             // 背景
             let (br, bg, bb) = lighten(self.bg_color, 1.0);
             let bg_brush = CreateSolidBrush(rgb(br, bg, bb));
@@ -573,6 +579,10 @@ impl Renderer {
                     }
                 }
             }
+
+            // 恢复完整裁剪区后释放圆角区域
+            SelectClipRgn(mem_dc, None);
+            DeleteObject(card_rgn.into());
 
             DeleteObject(title_font.into());
             DeleteObject(grid_font.into());
