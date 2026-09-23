@@ -93,6 +93,44 @@ fn rounded_row(y: i32, x0: i32, y0: i32, x1: i32, y1: i32, r: i32) -> Option<(i3
     Some((x0 + r - dxi, x1 - r + dxi))
 }
 
+/// 按可用宽度截断文本并加"…"（基于当前选中字体测量，避免按字符数截引起的
+/// CJK/拉丁宽度差异导致文字溢出到相邻卡片/图标，造成名称重叠）。
+/// 返回可直接传给 TextOutW 的 UTF-16 序列。
+fn fit_text(mem_dc: HDC, text: &str, max_w: i32) -> Vec<u16> {
+    unsafe {
+        let full: Vec<u16> = text.encode_utf16().collect();
+        if full.is_empty() {
+            return full;
+        }
+        if max_w <= 0 {
+            return "…".encode_utf16().collect();
+        }
+        let mut sz = SIZE::default();
+        GetTextExtentPoint32W(mem_dc, &full, &mut sz);
+        if sz.cx <= max_w {
+            return full; // 完整放得下：不截断
+        }
+        // 需要截断：预留"…"宽度，剩余空间按 UTF-16 单元累加测量（CJK/拉丁宽度自适应）
+        let ell: Vec<u16> = "…".encode_utf16().collect();
+        let mut esz = SIZE::default();
+        GetTextExtentPoint32W(mem_dc, &ell, &mut esz);
+        let avail = (max_w - esz.cx).max(0);
+        let mut cur: Vec<u16> = Vec::new();
+        for unit in text.encode_utf16() {
+            let mut test = cur.clone();
+            test.push(unit);
+            let mut tsz = SIZE::default();
+            GetTextExtentPoint32W(mem_dc, &test, &mut tsz);
+            if tsz.cx > avail && !cur.is_empty() {
+                break;
+            }
+            cur = test;
+        }
+        cur.extend_from_slice(&ell);
+        cur
+    }
+}
+
 pub struct Renderer {
     title_font: HFONT,
     item_font: HFONT,
@@ -536,14 +574,10 @@ impl Renderer {
                             } else {
                                 draw_fallback_badge(mem_dc, icon_x, icon_y, icon_sz, it, x + y);
                             }
-                            // 名字截断（超格宽显示 …），图标下方居中
+                            // 名字截断：按单元实际宽度测量截断加"…"，图标下方居中，绝不溢出到相邻单元
                             let g_old = SelectObject(mem_dc, grid_font.into());
                             SetTextColor(mem_dc, rgb(218, 222, 232));
-                            let short: String = it.display_name.chars().take(6).collect();
-                            let mut t: Vec<u16> = short.encode_utf16().collect();
-                            if it.display_name.chars().count() > 6 {
-                                t.extend("…".encode_utf16());
-                            }
+                            let t = fit_text(mem_dc, &it.display_name, cw - 4);
                             let mut tsz = SIZE::default();
                             GetTextExtentPoint32W(mem_dc, &t, &mut tsz);
                             TextOutW(mem_dc, gx + ((cw - 4 - tsz.cx) / 2).max(2), gy + icon_sz + name_gap, &t);
@@ -595,11 +629,13 @@ impl Renderer {
                                 } else {
                                     draw_fallback_badge(mem_dc, x + (12.0 * s) as i32, iy, icon_sz, it, x + y);
                                 }
-                                let line_w: Vec<u16> = it.display_name.encode_utf16().collect();
-                                TextOutW(mem_dc, x + (34.0 * s) as i32, iy, &line_w);
+                                let txt_x = x + (34.0 * s) as i32;
+                                let line_w = fit_text(mem_dc, &it.display_name, right - (10.0 * s) as i32 - txt_x - 4);
+                                TextOutW(mem_dc, txt_x, iy, &line_w);
                             } else {
-                                let line_w: Vec<u16> = it.display_name.encode_utf16().collect();
-                                TextOutW(mem_dc, x + (12.0 * s) as i32, py + ((rh - item_pt) / 2), &line_w);
+                                let txt_x = x + (12.0 * s) as i32;
+                                let line_w = fit_text(mem_dc, &it.display_name, right - (10.0 * s) as i32 - txt_x - 4);
+                                TextOutW(mem_dc, txt_x, py + ((rh - item_pt) / 2), &line_w);
                             }
                             SelectObject(mem_dc, l_old);
                         }

@@ -32,6 +32,7 @@ use crate::layout::{CardStyle, ResizeKind};
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::time::Instant;
 
 /// 被隐藏的桌面 SysListView32 句柄，退出时恢复
 static HIDDEN_DEFVIEW: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
@@ -59,6 +60,8 @@ static RENAME_DONE: AtomicBool = AtomicBool::new(false);
 /// 内联编辑中（防重入：点击其他区域会触发提交，嵌套双击须忽略）
 static RENAME_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RENAME_FONT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// 编辑框创建时刻，用于"创建瞬间失焦"宽限，防止"闪一下就没了"
+static RENAME_CREATED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 /// 前台辅助小窗：挂入桌面层后主窗口是 Progman 的子窗口无法置前台，
 /// TrackPopupMenu/键盘输入需要本线程成为前台线程（非前台线程拿不到鼠标捕获，菜单会"卡住"）
 static FG_HELPER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
@@ -1224,6 +1227,16 @@ unsafe extern "system" fn inline_edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp:
             return LRESULT(0);
         }
         WM_KILLFOCUS => {
+            // 创建后 300ms 内的失焦是"创建瞬间焦点churn"（SetFocus 生效前的瞬时切换），
+            // 直接忽略，避免编辑框刚弹出就被销毁（"闪一下就没了"）。
+            let too_early = RENAME_CREATED_AT
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .map(|t| t.elapsed().as_millis() < 300)
+                .unwrap_or(false);
+            if too_early {
+                return LRESULT(0);
+            }
             // 失焦：保存（点击编辑框外任意区域/切换到其他窗口）
             finish_inline_rename(true);
         }
@@ -1274,7 +1287,7 @@ fn finish_inline_rename(accept: bool) {
 /// 主窗口是 ULW 分层窗口（内容由 DIB 合成，子控件不渲染），故编辑框用无边框顶层窗定位。
 /// 几何与 renderer 标题区对齐：左 42*s（12*s 边距 + 20*s 图标 + 10*s 间隙），右侧避开数量徽章与按钮区。
 /// 失焦/Enter 提交，Esc 取消；应用与销毁延迟到 MSG_RENAME_DONE 在主窗口侧完成。
-fn begin_inline_rename(_main_hwnd: HWND, card_index: usize, card: &layout::Card) -> bool {
+fn begin_inline_rename(main_hwnd: HWND, card_index: usize, card: &layout::Card) -> bool {
     if RENAME_ACTIVE.swap(true, Ordering::SeqCst) {
         return false; // 已在编辑中（防重入）
     }
@@ -1301,6 +1314,9 @@ fn begin_inline_rename(_main_hwnd: HWND, card_index: usize, card: &layout::Card)
     // UTF-16 必须 NUL 终止（v0.4.4 教训：缺终止符导致 0x80070578）
     let mut title_w: Vec<u16> = card.title.encode_utf16().collect();
     title_w.push(0);
+    // 编辑框记下创建时刻，用于"创建瞬间失焦"宽限（v0.4.6：WS_EX_NOACTIVATE 主窗下
+    // 双击创建编辑框的瞬时焦点churn会触发 KILLFOCUS→立即销毁，表现为"闪一下就没了"）
+    *RENAME_CREATED_AT.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
     let edit = match unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW,
@@ -1308,7 +1324,7 @@ fn begin_inline_rename(_main_hwnd: HWND, card_index: usize, card: &layout::Card)
             PCWSTR(title_w.as_ptr()),
             WINDOW_STYLE((WS_POPUP | WS_BORDER | WS_VISIBLE).0 | ES_AUTOHSCROLL as u32),
             left, top, width, height,
-            None, None, Some(hinst.into()), None,
+            Some(main_hwnd), None, Some(hinst.into()), None, // owner=主窗：保持在其上方的 z 序
         )
     } {
         Ok(h) => h,
