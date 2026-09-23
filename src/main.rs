@@ -14,24 +14,23 @@ use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ,
 };
 use windows::Win32::System::Threading::{
-    CreateMutexW, GetCurrentProcessId, OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    AttachThreadInput, CreateMutexW, GetCurrentProcessId, GetCurrentThreadId, OpenProcess,
+    WaitForSingleObject, PROCESS_SYNCHRONIZE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+use windows::Win32::UI::Controls::EM_SETSEL;
 use windows::Win32::UI::Controls::Dialogs::{ChooseColorW, CHOOSECOLORW, CC_FULLOPEN, CC_RGBINIT};
 use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, IDYES, MB_YESNO,
 };
-use windows::Win32::UI::Shell::{
-    ShellExecuteW, SHGetDesktopFolder, IShellFolder, IShellView, IContextMenu,
-    SVGIO_BACKGROUND, CMF_NORMAL, CMINVOKECOMMANDINFO,
-};
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 use crate::layout::{CardStyle, ResizeKind};
 
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 /// 被隐藏的桌面 SysListView32 句柄，退出时恢复
 static HIDDEN_DEFVIEW: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
@@ -49,15 +48,19 @@ static MENU_OPEN: AtomicBool = AtomicBool::new(false);
 /// 卸载中标志：WM_DESTROY 跳过布局/设置保存（数据目录已被清理）
 static UNINSTALLING: AtomicBool = AtomicBool::new(false);
 
-/// 重命名对话框：编辑框句柄 / 原始编辑框窗口过程 / 对话框句柄 / 提交值 / 是否确认 / 是否关闭
+/// 内联重命名（标题栏原位编辑框）：编辑框句柄 / 原窗口过程 / 关联卡片索引 / 提交值 / 是否确认 / 是否已收集 / 编辑中 / 字体
 static RENAME_EDIT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static RENAME_EDIT_OLD: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-static RENAME_DLG: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static RENAME_CARD: AtomicUsize = AtomicUsize::new(usize::MAX);
 static RENAME_VALUE: Mutex<String> = Mutex::new(String::new());
 static RENAME_ACCEPTED: AtomicBool = AtomicBool::new(false);
 static RENAME_DONE: AtomicBool = AtomicBool::new(false);
-/// 重命名对话框打开中（防重入：模态循环会继续分发主窗口消息，嵌套双击会踩坏全局句柄）
+/// 内联编辑中（防重入：点击其他区域会触发提交，嵌套双击须忽略）
 static RENAME_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RENAME_FONT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// 前台辅助小窗：挂入桌面层后主窗口是 Progman 的子窗口无法置前台，
+/// TrackPopupMenu/键盘输入需要本线程成为前台线程（非前台线程拿不到鼠标捕获，菜单会"卡住"）
+static FG_HELPER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 /// 判断窗口是否属于"桌面区域"（我们的窗口 或 explorer 桌面层，排除任务栏/开始按钮/弹出菜单）
 fn is_desktop_area(hwnd_at: HWND) -> bool {
@@ -93,8 +96,15 @@ fn is_desktop_area(hwnd_at: HWND) -> bool {
     false
 }
 
-/// 全局鼠标钩子：监听主屏桌面空白的右键，通知主窗口弹系统原生菜单
-/// 卡片区域右键由主窗口弹自定义菜单；副屏右键由系统 SysListView32 原生处理
+/// 前台辅助小窗的窗口过程：DefWindowProcW 的 extern "system" 薄包装
+/// （windows-rs 将其声明为 Rust fn，无法直接作为 lpfnWndProc 传入）
+unsafe extern "system" fn helper_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+/// 全局鼠标钩子：监听主屏桌面的双击空白（切换卡片可见性）
+/// 卡片区域右键由主窗口直接处理；桌面空白右键由 explorer 原生弹出（v0.4.5 起不再拦截——
+/// 此前转发弹的自定义菜单因非前台线程拿不到鼠标捕获，出现"点外部不消失/右键又弹第二个菜单"）
 unsafe extern "system" fn ll_mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if ncode == 0 {
         // 菜单打开期间（TrackPopupMenu 模态循环）：完全透传，避免误判双击/误弹菜单
@@ -128,29 +138,6 @@ unsafe extern "system" fn ll_mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPAR
                             if !in_card {
                                 let _ = PostMessageW(Some(HWND(main)), MSG_TOGGLE, WPARAM(0), LPARAM(0));
                             }
-                        }
-                    }
-                }
-            }
-            if wparam.0 as u32 == WM_RBUTTONUP && pt.x >= 0 && pt.x < sw && pt.y >= 0 && pt.y < sh {
-                // 非桌面区域（正常应用窗口/任务栏）→ 不处理
-                if is_desktop_area(WindowFromPoint(pt)) {
-                    let main = MAIN_HWND.load(Ordering::SeqCst);
-                    if !main.is_null() {
-                        // 隐藏态下卡片不可见：整个桌面都视为空白，右键一律弹系统菜单
-                        let in_card = get_state(HWND(main)).map_or(false, |s| {
-                            s.visible && layout::hit_test(&s.cards, pt.x, pt.y).is_some()
-                        });
-                        // 卡片区域右键由主窗口弹自定义菜单，这里不处理
-                        if !in_card {
-                            let _ = PostMessageW(
-                                Some(HWND(main)),
-                                MSG_SYSMENU,
-                                WPARAM(pt.x as usize),
-                                LPARAM(pt.y as isize),
-                            );
-                            // 阻止 explorer 自己的桌面右键菜单弹出（避免双菜单）
-                            return LRESULT(1);
                         }
                     }
                 }
@@ -216,58 +203,6 @@ extern "system" {
     fn IsIconic(hwnd: HWND) -> windows::Win32::Foundation::BOOL;
 }
 
-/// 用 Shell COM 接口弹出系统原生桌面右键菜单（查看/排序/刷新/新建/显示设置/个性化等）
-/// 不依赖被隐藏的 SysListView32 窗口，通过桌面 IShellFolder → IShellView → 背景 IContextMenu 获取
-fn show_system_desktop_menu(hwnd: HWND, x: i32, y: i32) {
-    unsafe {
-        let desktop: IShellFolder = match SHGetDesktopFolder() {
-            Ok(d) => d,
-            Err(e) => { error_log(&format!("SHGetDesktopFolder err={}", e)); return; }
-        };
-        let view: IShellView = match desktop.CreateViewObject(hwnd) {
-            Ok(v) => v,
-            Err(e) => { error_log(&format!("CreateViewObject err={}", e)); return; }
-        };
-        let ctx: IContextMenu = match view.GetItemObject(SVGIO_BACKGROUND) {
-            Ok(c) => c,
-            Err(e) => { error_log(&format!("GetItemObject err={}", e)); return; }
-        };
-        let menu = match CreatePopupMenu() {
-            Ok(m) => m,
-            Err(_) => return,
-        };
-        const CMD_FIRST: u32 = 1;
-        const CMD_LAST: u32 = 0x7fff;
-        let hr = ctx.QueryContextMenu(menu, 0, CMD_FIRST, CMD_LAST, CMF_NORMAL);
-        if hr.is_ok() {
-            // 模态菜单期间置 MENU_OPEN：钩子完全透传，避免菜单点击被误判双击/拦截（与卡片菜单一致）
-            MENU_OPEN.store(true, Ordering::SeqCst);
-            // TPM_RETURNCMD：菜单选中的命令 ID 作为返回值；TPM_NONOTIFY：不发送 WM_COMMAND，自己 InvokeCommand
-            let cmd = TrackPopupMenu(
-                menu,
-                TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                x,
-                y,
-                None,
-                hwnd,
-                None,
-            );
-            let cmd_id = cmd.0 as u32;
-            if cmd_id >= CMD_FIRST && cmd_id <= CMD_LAST {
-                let mut ici = CMINVOKECOMMANDINFO::default();
-                ici.cbSize = std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32;
-                ici.hwnd = hwnd;
-                // MAKEINTRESOURCEA(idCmdOffset)：把命令偏移量当作 verb 指针
-                ici.lpVerb = PCSTR((cmd_id - CMD_FIRST) as isize as *const u8);
-                ici.nShow = SW_SHOWNORMAL.0;
-                let _ = ctx.InvokeCommand(&ici);
-            }
-            MENU_OPEN.store(false, Ordering::SeqCst);
-        }
-        let _ = DestroyMenu(menu);
-    }
-}
-
 /// 数据目录：%LOCALAPPDATA%\DesktopOrganizer（layout/settings/error.log 统一存放，卸载时整体删除）
 fn data_dir() -> std::path::PathBuf {
     let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
@@ -277,7 +212,7 @@ fn data_dir() -> std::path::PathBuf {
 }
 
 /// 错误日志：只记录错误（panic / Shell COM 失败等），写入数据目录 error.log
-fn error_log(msg: &str) {
+pub fn error_log(msg: &str) {
     use std::io::Write;
     let path = data_dir().join("error.log");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
@@ -405,8 +340,8 @@ const CMD_EXIT: usize = 3;
 const CMD_SETTINGS: usize = 4;
 const CMD_DISPLAY: usize = 5;
 const CMD_RENAME: usize = 6;
-/// 全局鼠标钩子转发桌面空白右键的自定义消息
-const MSG_SYSMENU: u32 = WM_APP + 1;
+/// 内联重命名完成（编辑框销毁 + 应用新标题）：wp = 卡片索引
+const MSG_RENAME_DONE: u32 = WM_APP + 4;
 /// 全局鼠标钩子检测双击空白的自定义消息（切换桌面可见性）
 const MSG_TOGGLE: u32 = WM_APP + 2;
 /// Win+D 兜底定时器 ID（每秒检查窗口可见性并恢复）
@@ -516,19 +451,40 @@ fn main() {
     let satom = unsafe { RegisterClassExW(&swc) };
     assert!(satom != 0, "RegisterClassExW 设置窗口失败");
 
-    // 重命名对话框类
-    let rename_class = w!("DeskOrgRenameDlg");
-    let rwc = WNDCLASSEXW {
+    // 前台辅助窗口类：挂入桌面层后主窗口是 Progman 子窗口无法置前台，
+    // 菜单/编辑框需要借这个 1x1 全透明小窗把本线程拉成前台线程
+    let helper_class = w!("DeskOrgHelper");
+    let hwc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        style: CS_HREDRAW | CS_VREDRAW,
-        lpfnWndProc: Some(rename_proc),
+        style: WNDCLASS_STYLES(0),
+        lpfnWndProc: Some(helper_proc),
         hInstance: hinst.into(),
-        hCursor: unsafe { LoadCursorW(None, IDC_ARROW).expect("LoadCursorW") },
-        lpszClassName: rename_class,
+        lpszClassName: helper_class,
         ..Default::default()
     };
-    let ratom = unsafe { RegisterClassExW(&rwc) };
-    assert!(ratom != 0, "RegisterClassExW 重命名窗口失败");
+    let hatom = unsafe { RegisterClassExW(&hwc) };
+    assert!(hatom != 0, "RegisterClassExW 前台辅助窗口失败");
+    if let Ok(helper) = unsafe {
+        CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+            helper_class,
+            w!(""),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            Some(hinst.into()),
+            None,
+        )
+    } {
+        // 全透明：不显示内容也不挡点击，仅用于承接前台
+        let _ = unsafe { SetLayeredWindowAttributes(helper, COLORREF(0), 0, LWA_ALPHA) };
+        unsafe { ShowWindow(helper, SW_SHOWNOACTIVATE) };
+        FG_HELPER.store(helper.0, Ordering::SeqCst);
+    }
 
     let hwnd = unsafe {
         CreateWindowExW(
@@ -575,22 +531,26 @@ fn main() {
                 }
                 Err(_) => {}
             }
-            // 放到 WorkerW 之后（壁纸之上、正常窗口之下），不改变父子关系
+            // v0.4.5 挂入桌面层：SetParent 到 SHELLDLL_DefView 的父窗口（本机=Progman）。
+            // 成为桌面子窗口后：Win+D/显示桌面不再收起卡片；普通应用窗口永远在卡片之上
+            // （此前顶层窗口被 WM_TIMER 的 SW_SHOW 激活置顶——"卡片跑到其他窗口上面"根因）。
             match GetParent(defview) {
-                Ok(workerw) => {
-                    if !workerw.is_invalid() {
-                        SetWindowPos(
-                            hwnd,
-                            Some(workerw),
-                            0,
-                            0,
-                            0,
-                            0,
-                            SET_WINDOW_POS_FLAGS(0x0001 | 0x0002 | 0x0010),
-                        );
+                Ok(parent) if !parent.is_invalid() => {
+                    // WS_POPUP → WS_CHILD：先改样式再挂父
+                    let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+                    let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, (style & !(WS_POPUP.0 as isize)) | WS_CHILD.0 as isize);
+                    if let Err(e) = SetParent(hwnd, Some(parent)) {
+                        error_log(&format!("SetParent 失败 {}", e));
+                    } else {
+                        // 子窗口坐标 = 屏幕坐标 - 父客户区原点（多屏副屏在左侧时原点为负）
+                        let mut org = POINT { x: 0, y: 0 };
+                        let _ = ClientToScreen(parent, &mut org);
+                        // 排到 DefView 之上：卡片像素(alpha>0)可点击，空白像素(alpha=0)透传给 DefView
+                        let _ = SetWindowPos(hwnd, Some(HWND_TOP), -org.x, -org.y, 0, 0,
+                            SET_WINDOW_POS_FLAGS(0x0001 | 0x0010 | 0x0020)); // SWP_NOSIZE|SWP_NOACTIVATE|SWP_FRAMECHANGED
                     }
                 }
-                Err(e) => error_log(&format!("GetParent err={}", e)),
+                _ => error_log("桌面层挂接失败：GetParent(DefView) 无效"),
             }
         }
         ShowWindow(hwnd, SW_SHOW);
@@ -710,20 +670,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                     }
                     return LRESULT(0);
                 }
-                // 双击标题栏 → 重命名分区（标题优先于图标项，避免几何边缘误开文件）
+                // 双击标题栏 → 原位内联重命名（标题优先于图标项，避免几何边缘误开文件）
                 if let Some(tci) = layout::hit_test_title(&s.cards, x, y) {
-                    // 双击标题栏 → 重命名分区（标题栏可直接修改）。
-                    // 先结束首击可能残留的拖拽/鼠标捕获，避免模态对话框受捕获干扰误触退出/误动卡片。
+                    // 先结束首击可能残留的拖拽/鼠标捕获，避免编辑框受捕获干扰误动卡片。
                     s.drag = None;
                     unsafe { ReleaseCapture(); }
-                    let cur = s.cards.get(tci).map(|c| c.title.clone()).unwrap_or_default();
-                    if let Some(name) = rename_card(hwnd, &cur) {
-                        if let Some(card) = s.cards.get_mut(tci) {
-                            if !name.trim().is_empty() {
-                                card.title = name;
-                            }
-                        }
-                        s.renderer.render(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+                    if let Some(card) = s.cards.get(tci) {
+                        begin_inline_rename(hwnd, tci, card);
                     }
                     return LRESULT(0);
                 } else if let Some((ci, ii)) = layout::hit_test_item(&s.cards, x, y, s.settings.show_icons) {
@@ -755,11 +708,32 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             }
             LRESULT(0)
         }
-        MSG_SYSMENU => {
-            // 全局鼠标钩子转发的桌面空白右键 → 弹系统原生桌面菜单
-            let x = wp.0 as i32;
-            let y = lp.0 as i32;
-            show_system_desktop_menu(hwnd, x, y);
+        MSG_RENAME_DONE => {
+            // 内联重命名结束：销毁编辑框并按需应用新标题（销毁放主窗口侧，避免编辑框消息内自销毁重入）
+            let edit = RENAME_EDIT.swap(std::ptr::null_mut(), Ordering::SeqCst);
+            if !edit.is_null() && unsafe { IsWindow(Some(HWND(edit))).as_bool() } {
+                unsafe { let _ = DestroyWindow(HWND(edit)); }
+            }
+            RENAME_EDIT_OLD.store(std::ptr::null_mut(), Ordering::SeqCst);
+            let font = RENAME_FONT.swap(std::ptr::null_mut(), Ordering::SeqCst);
+            if !font.is_null() {
+                unsafe { let _ = DeleteObject(HGDIOBJ(font)); };
+            }
+            RENAME_ACTIVE.store(false, Ordering::SeqCst);
+            let idx = wp.0 as usize;
+            if RENAME_ACCEPTED.swap(false, Ordering::SeqCst) && unsafe { IsWindow(Some(hwnd)).as_bool() } {
+                let value = RENAME_VALUE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                if !value.trim().is_empty() {
+                    if let Some(s) = get_state(hwnd) {
+                        if let Some(card) = s.cards.get_mut(idx) {
+                            card.title = value;
+                        }
+                        s.renderer.render(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
+                    }
+                }
+            }
+            // 归还前台给桌面（explorer），避免占用前台线程影响后续菜单/输入
+            give_foreground_to_desktop();
             LRESULT(0)
         }
         MSG_TOGGLE => {
@@ -868,11 +842,19 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                 if !s.visible {
                     return LRESULT(0);
                 }
+                // 内联编辑中：任何点击先提交改名并吞掉本击（不弹菜单）
+                if RENAME_ACTIVE.load(Ordering::SeqCst) {
+                    finish_inline_rename(true);
+                    return LRESULT(0);
+                }
                 let idx = layout::hit_test(&s.cards, x, y);
                 s.menu_card = idx;
                 match idx {
                     Some(_) => {
                         // 卡片内：自定义菜单（删除/新建/设置/退出）
+                        // v0.4.5：先拉本线程为前台（AttachThreadInput 技巧），否则 TrackPopupMenu
+                        // 非前台线程拿不到鼠标捕获 → 点菜单外不消失（"卡住"）
+                        make_self_foreground();
                         // 弹菜单期间置 MENU_OPEN，钩子透传，避免菜单点击被误判双击/拦截
                         MENU_OPEN.store(true, Ordering::SeqCst);
                         let menu = unsafe { CreatePopupMenu().expect("CreatePopupMenu") };
@@ -888,6 +870,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                             let _ = DestroyMenu(menu);
                         }
                         MENU_OPEN.store(false, Ordering::SeqCst);
+                        // 菜单关闭：归还前台给桌面（explorer）。
+                        // 「重命名分区」刚打开内联编辑框时前台须留给编辑框，不能归还
+                        if !RENAME_ACTIVE.load(Ordering::SeqCst) {
+                            give_foreground_to_desktop();
+                        }
                         // 菜单期间可能有数据变更（删除/新建分区），补一帧渲染
                         unsafe {
                             let _ = PostMessageW(Some(hwnd), MSG_RENDER, WPARAM(0), LPARAM(0));
@@ -913,14 +900,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                         }
                     }
                     CMD_RENAME => {
-                        // 重命名当前分区（标题栏可修改）
+                        // 重命名当前分区：标题栏原位内联编辑框
                         if let Some(idx) = s.menu_card {
-                            let cur = s.cards.get(idx).map(|c| c.title.clone()).unwrap_or_default();
-                            if let Some(name) = rename_card(hwnd, &cur) {
-                                if let Some(card) = s.cards.get_mut(idx) {
-                                    card.title = name;
-                                    changed = true;
-                                }
+                            if let Some(card) = s.cards.get(idx) {
+                                begin_inline_rename(hwnd, idx, card);
                             }
                         }
                     }
@@ -957,6 +940,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             if let Some(s) = get_state(hwnd) {
                 // 隐藏态不与隐形卡片交互（提示卡仅响应双击恢复）
                 if !s.visible {
+                    return LRESULT(0);
+                }
+                // 内联编辑中：任何点击先提交改名并吞掉本击（不落卡片交互/拖动）
+                if RENAME_ACTIVE.load(Ordering::SeqCst) {
+                    finish_inline_rename(true);
                     return LRESULT(0);
                 }
                 if let Some(idx) = layout::hit_test_close(&s.cards, x, y) {
@@ -1160,8 +1148,55 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             }
             LRESULT(0)
         }
+        WM_PARENTNOTIFY => {
+            // 挂入桌面层后，父窗口（Progman/DefView 父）会发 WM_PARENTNOTIFY 通告子窗口变动。
+            // 记录来源，用于排查"卡片窗口神秘自毁"（v0.4.5 重启后 DeskOrgWnd 偶发消失）。
+            let evt = (wp.0 & 0xffff) as u16 as i32;
+            let who = LPARAM(lp.0 & 0xffff).0 as u32;
+            let hint = match evt {
+                0x0001 => format!("WM_LBUTTONDOWN by hwnd={:#x}", who),
+                0x0002 => format!("WM_RBUTTONDOWN by hwnd={:#x}", who),
+                0x0003 => "WM_MBUTTONDOWN".to_string(),
+                0x0008 => format!("WM_CREATE child={:#x}", who),
+                0x0009 => format!("WM_DESTROY child={:#x}", who),
+                0x0011 => "WM_MOVE".to_string(),
+                0x0012 => "WM_SIZE".to_string(),
+                0x0080 => "WM_SHOWWINDOW".to_string(),
+                _ => format!("raw event={} who={:#x}", evt, who),
+            };
+            crate::error_log(&format!("PARENTNOTIFY: {}", hint));
+            LRESULT(0)
+        }
         WM_DESTROY => {
+            // 记录销毁上下文：父窗口/是否仍挂 Progman、桌面图标列表是否已还原，
+            // 用于排查 v0.4.5 重启后 DeskOrgWnd 偶发消失（被谁 Destroy 或重挂父后丢失）。
+            let parent_desc = unsafe {
+                match GetParent(hwnd) {
+                    Ok(h) if !h.is_invalid() => {
+                        let mut buf = [0u16; 32];
+                        let n = GetClassNameW(h, &mut buf).max(0) as usize;
+                        let cn = String::from_utf16_lossy(&buf[..n]);
+                        format!("parent={:#x} class={}", h.0 as usize, cn)
+                    }
+                    _ => "parent=0(顶层/无效)".to_string(),
+                }
+            };
+            crate::error_log(&format!("WM_DESTROY hwnd={:#x} [{}]", hwnd.0 as usize, parent_desc));
             unsafe { let _ = KillTimer(Some(hwnd), TIMER_ID); }
+            // 兜底清理：内联重命名编辑框/字体 + 前台辅助窗口
+            let edit = RENAME_EDIT.swap(std::ptr::null_mut(), Ordering::SeqCst);
+            if !edit.is_null() && unsafe { IsWindow(Some(HWND(edit))).as_bool() } {
+                unsafe { let _ = DestroyWindow(HWND(edit)); }
+            }
+            let font = RENAME_FONT.swap(std::ptr::null_mut(), Ordering::SeqCst);
+            if !font.is_null() {
+                unsafe { let _ = DeleteObject(HGDIOBJ(font)); };
+            }
+            RENAME_ACTIVE.store(false, Ordering::SeqCst);
+            let helper = FG_HELPER.swap(std::ptr::null_mut(), Ordering::SeqCst);
+            if !helper.is_null() && unsafe { IsWindow(Some(HWND(helper))).as_bool() } {
+                unsafe { let _ = DestroyWindow(HWND(helper)); }
+            }
             if !UNINSTALLING.load(Ordering::SeqCst) {
                 if let Some(s) = get_state(hwnd) {
                     let lp = data_dir().join("layout.json");
@@ -1190,238 +1225,182 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
     }
 }
 
-/// 重命名对话框输入框的子类化过程：Enter 提交、Esc 取消
-unsafe extern "system" fn rename_edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if msg == WM_KEYDOWN {
-        let dlg = RENAME_DLG.load(Ordering::SeqCst);
-        if !dlg.is_null() {
-            if wp.0 == 0x0D {
-                // Enter
-                let _ = PostMessageW(Some(HWND(dlg)), WM_COMMAND, WPARAM(1), LPARAM(0));
-                return LRESULT(0);
-            }
-            if wp.0 == 0x1B {
-                // Esc
-                let _ = PostMessageW(Some(HWND(dlg)), WM_COMMAND, WPARAM(2), LPARAM(0));
-                return LRESULT(0);
-            }
+/// 内联重命名编辑框子类化过程：Enter 提交、Esc 取消、失焦保存
+unsafe extern "system" fn inline_edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_KEYDOWN if wp.0 == 0x0D => {
+            // Enter：提交
+            finish_inline_rename(true);
+            return LRESULT(0);
         }
+        WM_KEYDOWN if wp.0 == 0x1B => {
+            // Esc：取消
+            finish_inline_rename(false);
+            return LRESULT(0);
+        }
+        WM_KILLFOCUS => {
+            // 失焦：保存（点击编辑框外任意区域/切换到其他窗口）
+            finish_inline_rename(true);
+        }
+        _ => {}
     }
     let old = RENAME_EDIT_OLD.load(Ordering::SeqCst);
     if !old.is_null() {
         let old_fn: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = unsafe { std::mem::transmute(old) };
         return CallWindowProcW(Some(old_fn), hwnd, msg, wp, lp);
     }
-    unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+    DefWindowProcW(hwnd, msg, wp, lp)
 }
 
-/// 重命名对话框窗口过程：OK/Cancel 提交或取消
-unsafe extern "system" fn rename_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    match msg {
-        WM_COMMAND => {
-            // v0.4.4 根因修复：必须校验 HIWORD=BN_CLICKED 才是按钮点击。
-            // 此前只看 LOWORD（控件 ID）：EDIT 创建时初始文本触发 EN_CHANGE 通知
-            // （LOWORD=ID 2），被误判成"取消"→ DestroyWindow → EDIT 创建失去父窗口
-            // 报 0x80070578 → panic=abort → 进程无提示退出（双击直接闪退）
-            let code = ((wp.0 as u32) >> 16) as u32;
-            let id = (wp.0 as u32 & 0xffff) as i32;
-            if code == BN_CLICKED as u32 && (id == 1 || id == 2) {
-                if id == 1 {
-                    // 确定：读取编辑框文本
-                    let edit = RENAME_EDIT.load(Ordering::SeqCst);
-                    if !edit.is_null() {
-                        let len = GetWindowTextLengthW(HWND(edit)) as usize;
-                        let mut buf = vec![0u16; len + 1];
-                        let got = GetWindowTextW(HWND(edit), &mut buf) as usize;
-                        let s = String::from_utf16_lossy(&buf[..got]).trim().to_string();
-                        if !s.is_empty() {
-                            *RENAME_VALUE.lock().unwrap() = s;
-                            RENAME_ACCEPTED.store(true, Ordering::SeqCst);
-                        }
-                    }
-                } else {
-                    RENAME_ACCEPTED.store(false, Ordering::SeqCst);
-                }
-                let _ = DestroyWindow(hwnd);
-                return LRESULT(0);
-            }
-            LRESULT(0)
+/// 收集编辑结果并通知主窗口应用。在编辑框消息处理内被调用——立即销毁自身有重入风险，
+/// 只读值+发消息，销毁交给 MSG_RENAME_DONE 在主窗口侧完成。
+fn finish_inline_rename(accept: bool) {
+    let e = RENAME_EDIT.load(Ordering::SeqCst);
+    if e.is_null() {
+        return;
+    }
+    if RENAME_DONE.swap(true, Ordering::SeqCst) {
+        return; // 防重入（Enter 后又失焦等）
+    }
+    if accept && unsafe { IsWindow(Some(HWND(e))).as_bool() } {
+        let len = unsafe { GetWindowTextLengthW(HWND(e)) }.max(0) as usize;
+        let mut buf = vec![0u16; len + 1];
+        let got = unsafe { GetWindowTextW(HWND(e), &mut buf) } as usize;
+        let s = String::from_utf16_lossy(&buf[..got]).trim().to_string();
+        if !s.is_empty() {
+            *RENAME_VALUE.lock().unwrap_or_else(|p| p.into_inner()) = s;
+            RENAME_ACCEPTED.store(true, Ordering::SeqCst);
         }
-        WM_DESTROY => {
-            RENAME_DONE.store(true, Ordering::SeqCst);
-            LRESULT(0)
+    }
+    let main = MAIN_HWND.load(Ordering::SeqCst);
+    if !main.is_null() {
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(main)),
+                MSG_RENAME_DONE,
+                WPARAM(RENAME_CARD.load(Ordering::SeqCst)),
+                LPARAM(0),
+            );
         }
-        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }
 }
 
-/// 弹出重命名对话框（模态），返回新标题；取消返回 None。
-/// 外层防重入：对话框已打开时忽略新的双击/菜单项（模态循环仍会分发主窗口消息）
-fn rename_card(owner: HWND, current: &str) -> Option<String> {
+/// 标题栏原位内联重命名：标题文本位置覆盖一个顶层 EDIT 小窗（v0.4.5 替代模态对话框）。
+/// 主窗口是 ULW 分层窗口（内容由 DIB 合成，子控件不渲染），故编辑框用无边框顶层窗定位。
+/// 几何与 renderer 标题区对齐：左 42*s（12*s 边距 + 20*s 图标 + 10*s 间隙），右侧避开数量徽章与按钮区。
+/// 失焦/Enter 提交，Esc 取消；应用与销毁延迟到 MSG_RENAME_DONE 在主窗口侧完成。
+fn begin_inline_rename(_main_hwnd: HWND, card_index: usize, card: &layout::Card) -> bool {
     if RENAME_ACTIVE.swap(true, Ordering::SeqCst) {
-        return None;
+        return false; // 已在编辑中（防重入）
     }
-    let r = rename_card_inner(owner, current);
-    RENAME_ACTIVE.store(false, Ordering::SeqCst);
-    r
-}
-
-/// 重命名对话框实现：任何失败只写 error.log 并优雅返回，绝不 panic（panic=abort 会直接杀死进程）
-fn rename_card_inner(owner: HWND, current: &str) -> Option<String> {
     RENAME_DONE.store(false, Ordering::SeqCst);
     RENAME_ACCEPTED.store(false, Ordering::SeqCst);
-    RENAME_VALUE.lock().unwrap().clear();
+    RENAME_VALUE.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    RENAME_CARD.store(card_index, Ordering::SeqCst);
+
+    let s = layout::card_scale(card.width);
+    let th = layout::title_h(card.width);
+    let left = card.x + (42.0 * s) as i32;
+    let width = ((card.width as f32) - 42.0 * s - 110.0 * s).max(48.0) as i32;
+    let top = card.y + 4;
+    let height = (th - 8).max(18);
 
     let hinst = match unsafe { GetModuleHandleW(None) } {
         Ok(h) => h,
         Err(e) => {
             error_log(&format!("rename: GetModuleHandleW 失败 {}", e));
-            return None;
+            RENAME_ACTIVE.store(false, Ordering::SeqCst);
+            return false;
         }
     };
-    // UTF-16 必须 NUL 终止：此前缺终止符，Win32 按字符串复制会读越过缓冲区，
-    // 导致 EDIT 创建报 0x80070578（无效的窗口句柄）——v0.4.4 根因
-    let mut title_w: Vec<u16> = current.encode_utf16().collect();
+    // UTF-16 必须 NUL 终止（v0.4.4 教训：缺终止符导致 0x80070578）
+    let mut title_w: Vec<u16> = card.title.encode_utf16().collect();
     title_w.push(0);
-    let dlg = match unsafe {
-        CreateWindowExW(
-            WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
-            w!("DeskOrgRenameDlg"),
-            w!("重命名分区"),
-            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-            0,
-            0,
-            320,
-            140,
-            Some(owner),
-            None,
-            Some(hinst.into()),
-            None,
-        )
-    } {
-        Ok(h) => h,
-        Err(e) => {
-            error_log(&format!("rename: 对话框创建失败 {}", e));
-            return None;
-        }
-    };
-    if !unsafe { IsWindow(Some(dlg)) }.as_bool() {
-        error_log("rename: 对话框创建后句柄即无效");
-        return None;
-    }
-    RENAME_DLG.store(dlg.0 as *mut c_void, Ordering::SeqCst);
-
-    // 居中于主窗口
-    unsafe {
-        let mut rc = RECT::default();
-        let _ = GetWindowRect(owner, &mut rc);
-        let sw = GetSystemMetrics(SM_CXSCREEN);
-        let sh = GetSystemMetrics(SM_CYSCREEN);
-        let cx = rc.left + (rc.right - rc.left) / 2 - 160;
-        let cy = rc.top + (rc.bottom - rc.top) / 2 - 70;
-        if let Err(e) = SetWindowPos(dlg, None, cx.clamp(0, sw - 320), cy.clamp(0, sh - 140), 0, 0, SWP_NOSIZE | SWP_NOZORDER) {
-            error_log(&format!("rename: 定位失败 {} IsWindow={}", e, IsWindow(Some(dlg)).as_bool() as u8));
-        }
-    }
-    if !unsafe { IsWindow(Some(dlg)) }.as_bool() {
-        error_log("rename: 定位后对话框句柄失效");
-        return None;
-    }
-
-    // 标签
-    if let Err(e) = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            w!("STATIC"),
-            w!("输入分区名称："),
-            WS_CHILD | WS_VISIBLE,
-            16, 16, 280, 20,
-            Some(dlg), Some(HMENU(1usize as *mut c_void)), Some(hinst.into()), None,
-        )
-    } {
-        error_log(&format!("rename: 标签创建失败 {} IsWindow={}", e, unsafe { IsWindow(Some(dlg)) }.as_bool() as u8));
-        let _ = unsafe { DestroyWindow(dlg) };
-        return None;
-    }
-    // 输入框（子类化：Enter/Esc）
     let edit = match unsafe {
         CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            WS_EX_TOOLWINDOW,
             w!("EDIT"),
             PCWSTR(title_w.as_ptr()),
-            WINDOW_STYLE((WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP).0 | ES_AUTOHSCROLL as u32),
-            16, 44, 280, 26,
-            Some(dlg), Some(HMENU(2usize as *mut c_void)), Some(hinst.into()), None,
+            WINDOW_STYLE((WS_POPUP | WS_BORDER | WS_VISIBLE).0 | ES_AUTOHSCROLL as u32),
+            left, top, width, height,
+            None, None, Some(hinst.into()), None,
         )
     } {
         Ok(h) => h,
         Err(e) => {
-            error_log(&format!("rename: 输入框创建失败 {} IsWindow={}", e, unsafe { IsWindow(Some(dlg)) }.as_bool() as u8));
-            let _ = unsafe { DestroyWindow(dlg) };
-            return None;
+            error_log(&format!("rename: 编辑框创建失败 {}", e));
+            RENAME_ACTIVE.store(false, Ordering::SeqCst);
+            return false;
         }
     };
     RENAME_EDIT.store(edit.0 as *mut c_void, Ordering::SeqCst);
-    let old_proc = unsafe { SetWindowLongPtrW(edit, GWLP_WNDPROC, rename_edit_proc as isize) };
-    RENAME_EDIT_OLD.store(old_proc as *mut c_void, Ordering::SeqCst);
+    let old = unsafe { SetWindowLongPtrW(edit, GWLP_WNDPROC, inline_edit_proc as isize) };
+    RENAME_EDIT_OLD.store(old as *mut c_void, Ordering::SeqCst);
 
-    // 确定 / 取消按钮
-    if let Err(e) = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            w!("BUTTON"),
-            w!("确定"),
-            WINDOW_STYLE((WS_CHILD | WS_VISIBLE | WS_TABSTOP).0 | BS_DEFPUSHBUTTON as u32),
-            168, 86, 64, 28,
-            Some(dlg), Some(HMENU(1usize as *mut c_void)), Some(hinst.into()), None,
+    // 与标题同款字体（YaHei Bold + ClearType），视觉上"标题栏变成可输入文本框"
+    let font = unsafe {
+        CreateFontW(
+            (17.0 * s).max(11.0) as i32, 0, 0, 0, FW_BOLD.0 as i32, 0, 0, 0,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+            (DEFAULT_PITCH.0 | FF_SWISS.0) as u32,
+            w!("Microsoft YaHei"),
         )
-    } {
-        error_log(&format!("rename: 确定按钮创建失败 {}", e));
-        let _ = unsafe { DestroyWindow(dlg) };
-        return None;
+    };
+    RENAME_FONT.store(font.0 as *mut c_void, Ordering::SeqCst);
+    unsafe {
+        let _ = SendMessageW(edit, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+        // 前台借用：编辑框要接键盘输入，须先把本线程拉成前台线程
+        make_self_foreground();
+        let _ = SetForegroundWindow(edit);
+        let _ = SetFocus(edit);
+        let _ = SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1))); // 全选：直接输入即覆盖
     }
-    if let Err(e) = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            w!("BUTTON"),
-            w!("取消"),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            240, 86, 64, 28,
-            Some(dlg), Some(HMENU(2usize as *mut c_void)), Some(hinst.into()), None,
-        )
-    } {
-        error_log(&format!("rename: 取消按钮创建失败 {}", e));
-        let _ = unsafe { DestroyWindow(dlg) };
-        return None;
-    }
-    unsafe { SetFocus(edit) };
+    true
+}
 
-    // 模态消息循环：直到对话框销毁。
-    // GetMessageW 返回 0=WM_QUIT、-1=错误；此前 -1 经 as_bool() 也判为真，会用无效 MSG 调用 Dispatch
-    let mut msg = MSG::default();
-    while !RENAME_DONE.load(Ordering::SeqCst) {
-        let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
-        if r.0 <= 0 {
-            break;
+/// 拉本线程为前台线程（借 1x1 全透明辅助小窗 FG_HELPER）。挂入桌面层后主窗口是
+/// Progman 的子窗口无法置前台；TrackPopupMenu/编辑框键盘输入要求本线程为前台线程，
+/// 否则菜单拿不到鼠标捕获——"点菜单外不消失/卡住"根因（经典托盘菜单 AttachThreadInput 技巧）。
+fn make_self_foreground() {
+    unsafe {
+        let helper = HWND(FG_HELPER.load(Ordering::SeqCst));
+        if helper.is_invalid() {
+            return;
         }
-        unsafe {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        let our_tid = GetCurrentThreadId();
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() {
+            let _ = SetForegroundWindow(helper);
+            return;
         }
+        let fg_tid = GetWindowThreadProcessId(fg, None);
+        if fg_tid == our_tid {
+            return; // 本线程已是前台
+        }
+        // 临时绑定前台线程后置前台，绕过系统前台锁定
+        let _ = AttachThreadInput(our_tid, fg_tid, true);
+        let _ = SetForegroundWindow(helper);
+        let _ = AttachThreadInput(our_tid, fg_tid, false);
     }
+}
 
-    // 循环经 WM_QUIT/错误退出时对话框可能仍在：销毁避免残留孤儿窗口
-    if unsafe { IsWindow(Some(dlg)) }.as_bool() {
-        let _ = unsafe { DestroyWindow(dlg) };
-    }
-    RENAME_DONE.store(false, Ordering::SeqCst);
-    RENAME_EDIT.store(std::ptr::null_mut(), Ordering::SeqCst);
-    RENAME_EDIT_OLD.store(std::ptr::null_mut(), Ordering::SeqCst);
-    RENAME_DLG.store(std::ptr::null_mut(), Ordering::SeqCst);
-    if RENAME_ACCEPTED.load(Ordering::SeqCst) {
-        Some(RENAME_VALUE.lock().unwrap().clone())
-    } else {
-        None
+/// 归还前台给桌面（explorer）。仅当当前前台属于本进程/explorer 时才设置——
+/// 用户若已点开其他应用（前台已切换），不得抢占其前台。
+fn give_foreground_to_desktop() {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() {
+            return;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(fg, Some(&mut pid));
+        if pid != OUR_PID.load(Ordering::SeqCst) && pid != EXPLORER_PID.load(Ordering::SeqCst) {
+            return; // 前台是其他应用：不抢占
+        }
+        let progman = GetShellWindow();
+        if !progman.is_invalid() {
+            let _ = SetForegroundWindow(progman);
+        }
     }
 }
 

@@ -34,6 +34,21 @@ fn make_font(height: i32, bold: bool) -> HFONT {
     }
 }
 
+/// 主窗口挂入桌面层（Progman 子窗口，v0.4.5）后的定位换算：子窗口坐标 = 屏幕坐标 - 父客户区原点。
+/// 多屏副屏在左侧时 Progman 客户区原点为负（本机 -1920,0），忽略偏移卡片会整体偏移到副屏。
+/// 顶层窗口（挂接失败兜底）时返回 (0,0)：屏幕坐标即窗口坐标。
+fn parent_client_org(hwnd: HWND) -> (i32, i32) {
+    unsafe {
+        let parent = GetAncestor(hwnd, GA_PARENT);
+        if parent.is_invalid() {
+            return (0, 0);
+        }
+        let mut pt = POINT { x: 0, y: 0 };
+        let _ = ClientToScreen(parent, &mut pt);
+        (pt.x, pt.y)
+    }
+}
+
 /// 圆角矩形带符号距离（SDF）：返回 <0 表示在内部，>0 在外部，0 在边界上。
 /// 输入为像素采样中心坐标与矩形 [x0,x1)×[y0,y1)，圆角半径 r。
 fn rounded_sd(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> f32 {
@@ -203,12 +218,15 @@ impl Renderer {
                     AlphaFormat: AC_SRC_ALPHA as u8,
                 };
                 let src_pt = POINT { x: 0, y: 0 };
-                let dst_pt = POINT { x: 0, y: 0 };
+                let (ogx, ogy) = parent_client_org(hwnd);
+                let dst_pt = POINT { x: -ogx, y: -ogy };
                 let size = SIZE { cx: w, cy: h };
-                let _ = UpdateLayeredWindow(
+                if let Err(e) = UpdateLayeredWindow(
                     hwnd, None, Some(&dst_pt), Some(&size), Some(mem_dc), Some(&src_pt),
                     COLORREF(0), Some(&blend), ULW_ALPHA,
-                );
+                ) {
+                    crate::error_log(&format!("ULW(hidden) 失败: {}", e));
+                }
                 return;
             }
 
@@ -242,11 +260,14 @@ impl Renderer {
             };
             let src_pt = POINT { x: ox, y: oy };
             let size = SIZE { cx: cw, cy: ch };
-            let dst_pt = POINT { x: ox, y: oy };
-            let _ = UpdateLayeredWindow(
+            let (ogx, ogy) = parent_client_org(hwnd);
+            let dst_pt = POINT { x: ox - ogx, y: oy - ogy };
+            if let Err(e) = UpdateLayeredWindow(
                 hwnd, None, Some(&dst_pt), Some(&size), Some(mem_dc), Some(&src_pt),
                 COLORREF(0), Some(&blend), ULW_ALPHA,
-            );
+            ) {
+                crate::error_log(&format!("ULW(full/partial) 失败: {}", e));
+            }
         }
     }
 
@@ -348,11 +369,14 @@ impl Renderer {
             };
             let src_pt = POINT { x: ox, y: oy };
             let size = SIZE { cx: cw, cy: ch };
-            let dst_pt = POINT { x: ox, y: oy };
-            let _ = UpdateLayeredWindow(
+            let (ogx, ogy) = parent_client_org(hwnd);
+            let dst_pt = POINT { x: ox - ogx, y: oy - ogy };
+            if let Err(e) = UpdateLayeredWindow(
                 hwnd, None, Some(&dst_pt), Some(&size), Some(mem_dc), Some(&src_pt),
                 COLORREF(0), Some(&blend), ULW_ALPHA,
-            );
+            ) {
+                crate::error_log(&format!("ULW(full/partial) 失败: {}", e));
+            }
         }
     }
 

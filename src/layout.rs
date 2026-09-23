@@ -253,6 +253,9 @@ pub fn hit_test_title(cards: &[Card], x: i32, y: i32) -> Option<usize> {
 #[derive(Serialize, Deserialize)]
 pub struct SavedCard {
     pub kind: String,
+    /// 自定义分区标题（v0.4.5 起持久化；旧布局无此字段时为空 → 保留默认标题）
+    #[serde(default)]
+    pub title: String,
     pub x: i32,
     pub y: i32,
     #[serde(default)]
@@ -267,6 +270,7 @@ pub fn save_layout(cards: &[Card], path: &str) {
         .iter()
         .map(|c| SavedCard {
             kind: c.kind.label().to_string(),
+            title: c.title.clone(),
             x: c.x,
             y: c.y,
             width: c.width,
@@ -299,6 +303,10 @@ pub fn load_layout(cards: &mut [Card], path: &str) {
                     if !overlap {
                         card.x = sc.x;
                         card.y = sc.y;
+                        // 恢复自定义标题（空 = 旧布局文件未改名，保留默认标题）
+                        if !sc.title.trim().is_empty() {
+                            card.title = sc.title;
+                        }
                         if sc.width > 0 {
                             card.width = sc.width;
                         }
