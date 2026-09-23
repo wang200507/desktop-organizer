@@ -3,6 +3,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::layout::{Card, CardStyle};
+use crate::layout::{card_scale, title_h, content_top, cell_w, cell_h, row_h};
 use crate::scanner::DesktopItem;
 
 fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
@@ -18,18 +19,40 @@ fn lighten(c: u32, f: f32) -> (u8, u8, u8) {
     )
 }
 
-/// 卡片圆角半径
+/// 卡片圆角半径（基准，随卡片缩放）
 const CARD_RADIUS: i32 = 12;
-/// 标题栏高度（与 layout.rs 命中测试保持一致）
-const TITLE_H: i32 = 36;
-/// 内容区顶部（标题栏 + 分隔线以下）
-const CONTENT_TOP: i32 = 42;
-/// 网格单元尺寸（与 layout.rs 命中测试保持一致）
-const CELL_W: i32 = 96;
-const CELL_H: i32 = 74;
 
-/// 圆角矩形第 y 行的可见 x 区间（含边界逻辑与 GDI 椭圆角近似）
-/// 返回 None 表示该行完全在圆角外
+/// 创建指定字号的 Microsoft YaHei 字体（CLEARTYPE）
+fn make_font(height: i32, bold: bool) -> HFONT {
+    unsafe {
+        CreateFontW(
+            height, 0, 0, 0, if bold { FW_BOLD.0 as i32 } else { FW_NORMAL.0 as i32 }, 0, 0, 0,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+            (DEFAULT_PITCH.0 | FF_SWISS.0) as u32,
+            w!("Microsoft YaHei"),
+        )
+    }
+}
+
+/// 圆角矩形带符号距离（SDF）：返回 <0 表示在内部，>0 在外部，0 在边界上。
+/// 输入为像素采样中心坐标与矩形 [x0,x1)×[y0,y1)，圆角半径 r。
+fn rounded_sd(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> f32 {
+    let hw = (x1 - x0) * 0.5;
+    let hh = (y1 - y0) * 0.5;
+    let cxm = (x0 + x1) * 0.5;
+    let cym = (y0 + y1) * 0.5;
+    let ax = hw - r;
+    let ay = hh - r;
+    let qx = px - cxm;
+    let qy = py - cym;
+    let bx = qx.abs() - ax;
+    let by = qy.abs() - ay;
+    let inner = bx.max(by).max(0.0).min(0.0);
+    let outer = (bx.max(0.0) * bx.max(0.0) + by.max(0.0) * by.max(0.0)).sqrt();
+    inner + outer - r
+}
+
+/// 圆角矩形第 y 行的粗略可见 x 区间（仅用于裁剪外层循环，含扫描范围放宽 1px 以容纳抗锯齿）
 fn rounded_row(y: i32, x0: i32, y0: i32, x1: i32, y1: i32, r: i32) -> Option<(i32, i32)> {
     if y < y0 || y >= y1 || x1 <= x0 {
         return None;
@@ -51,7 +74,7 @@ fn rounded_row(y: i32, x0: i32, y0: i32, x1: i32, y1: i32, r: i32) -> Option<(i3
     } else {
         return Some((x0, x1));
     };
-    let dxi = dx.ceil() as i32;
+    let dxi = dx.ceil() as i32 + 1; // +1 为 AA 留余量
     Some((x0 + r - dxi, x1 - r + dxi))
 }
 
@@ -70,37 +93,20 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new() -> Self {
-        unsafe {
-            let title_font = CreateFontW(
-                17, 0, 0, 0, FW_BOLD.0 as i32, 0, 0, 0,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                (DEFAULT_PITCH.0 | FF_SWISS.0) as u32,
-                w!("Microsoft YaHei"),
-            );
-            let item_font = CreateFontW(
-                15, 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                (DEFAULT_PITCH.0 | FF_SWISS.0) as u32,
-                w!("Microsoft YaHei"),
-            );
-            let grid_font = CreateFontW(
-                12, 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                (DEFAULT_PITCH.0 | FF_SWISS.0) as u32,
-                w!("Microsoft YaHei"),
-            );
-            Self {
-                title_font,
-                item_font,
-                grid_font,
-                mem_dc: None,
-                hbitmap: None,
-                old_bmp: None,
-                bits: std::ptr::null_mut(),
-                w: 0,
-                h: 0,
-                bg_color: 0x262A36,
-            }
+        let title_font = make_font(17, true);
+        let item_font = make_font(15, false);
+        let grid_font = make_font(12, false);
+        Self {
+            title_font,
+            item_font,
+            grid_font,
+            mem_dc: None,
+            hbitmap: None,
+            old_bmp: None,
+            bits: std::ptr::null_mut(),
+            w: 0,
+            h: 0,
+            bg_color: 0x262A36,
         }
     }
 
@@ -143,20 +149,22 @@ impl Renderer {
         }
     }
 
-    /// 滚动越界收敛（resize 变小后 scroll 可能超过上限）
+    /// 滚动越界收敛（resize 变小后 scroll 可能超过上限）——按卡片缩放后的几何计算
     fn clamp_scroll(cards: &mut [Card], show_icons: bool) {
         for card in cards.iter_mut() {
             let content_bottom = card.y + card.height - 8;
             let max_scroll = match card.style {
                 CardStyle::Grid => {
-                    let cols = ((card.width - 16) / CELL_W).max(1);
-                    let rows_visible = ((content_bottom - card.y - CONTENT_TOP) / CELL_H).max(1);
+                    let cw = cell_w(card.width).max(1);
+                    let ch = cell_h(card.width).max(1);
+                    let cols = ((card.width - 16) / cw).max(1);
+                    let rows_visible = ((content_bottom - card.y - content_top(card.width)) / ch).max(1);
                     let total_rows = ((card.item_indices.len() as i32 + cols - 1) / cols).max(1);
                     (total_rows - rows_visible).max(0)
                 }
                 CardStyle::List => {
-                    let row_h = if show_icons { 26 } else { 22 };
-                    let visible_rows = ((content_bottom - card.y - CONTENT_TOP) / row_h).max(1);
+                    let rh = row_h(card.width, show_icons).max(1);
+                    let visible_rows = ((content_bottom - card.y - content_top(card.width)) / rh).max(1);
                     (card.item_indices.len() as i32 - visible_rows).max(0)
                 }
             };
@@ -164,7 +172,7 @@ impl Renderer {
         }
     }
 
-    /// 全量渲染：清空整个表面 + 绘制所有卡片（结构性变化用）
+    /// 全量渲染：清空整个表面 + 绘制所有卡片（结构性变化与卡片拖动用）
     pub fn render(&mut self, hwnd: HWND, cards: &mut [Card], items: &[DesktopItem], visible: bool, alpha: u8, show_icons: bool, selected: Option<(usize, usize)>) {
         unsafe {
             let w = GetSystemMetrics(SM_CXSCREEN);
@@ -198,15 +206,8 @@ impl Renderer {
                 let dst_pt = POINT { x: 0, y: 0 };
                 let size = SIZE { cx: w, cy: h };
                 let _ = UpdateLayeredWindow(
-                    hwnd,
-                    None,
-                    Some(&dst_pt),
-                    Some(&size),
-                    Some(mem_dc),
-                    Some(&src_pt),
-                    COLORREF(0),
-                    Some(&blend),
-                    ULW_ALPHA,
+                    hwnd, None, Some(&dst_pt), Some(&size), Some(mem_dc), Some(&src_pt),
+                    COLORREF(0), Some(&blend), ULW_ALPHA,
                 );
                 return;
             }
@@ -243,24 +244,15 @@ impl Renderer {
             let size = SIZE { cx: cw, cy: ch };
             let dst_pt = POINT { x: ox, y: oy };
             let _ = UpdateLayeredWindow(
-                hwnd,
-                None,
-                Some(&dst_pt),
-                Some(&size),
-                Some(mem_dc),
-                Some(&src_pt),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
+                hwnd, None, Some(&dst_pt), Some(&size), Some(mem_dc), Some(&src_pt),
+                COLORREF(0), Some(&blend), ULW_ALPHA,
             );
         }
     }
 
-    /// 局部渲染：只清空/重绘 damage 区域（拖拽、滚动、选中切换用，避免全屏重绘卡顿）
-    /// damage 为屏幕坐标矩形 (x0, y0, x1, y1)
+    /// 局部渲染：只清空/重绘 damage 区域（滚动、选中切换用，避免全屏重绘卡顿）
     pub fn render_damage(&mut self, hwnd: HWND, cards: &mut [Card], items: &[DesktopItem], visible: bool, alpha: u8, show_icons: bool, selected: Option<(usize, usize)>, damage: &[(i32, i32, i32, i32)]) {
         if !visible {
-            // 隐藏态只有一张提示卡，直接走全量
             self.render(hwnd, cards, items, visible, alpha, show_icons, selected);
             return;
         }
@@ -270,17 +262,9 @@ impl Renderer {
             if w <= 0 || h <= 0 {
                 return;
             }
-            // 裁剪到屏幕内的有效区域
             let rects: Vec<(i32, i32, i32, i32)> = damage
                 .iter()
-                .map(|&(x0, y0, x1, y1)| {
-                    (
-                        x0.max(0),
-                        y0.max(0),
-                        x1.min(w),
-                        y1.min(h),
-                    )
-                })
+                .map(|&(x0, y0, x1, y1)| (x0.max(0), y0.max(0), x1.min(w), y1.min(h)))
                 .filter(|&(x0, y0, x1, y1)| x1 > x0 && y1 > y0)
                 .collect();
             if rects.is_empty() {
@@ -291,7 +275,7 @@ impl Renderer {
             let mem_dc = self.mem_dc.unwrap();
             let data = self.bits as *mut u8;
 
-            // 1) 只清空 damage 区域（避免整屏 8MB+ memset）
+            // 1) 只清空 damage 区域
             for &(x0, y0, x1, y1) in &rects {
                 for y in y0..y1 {
                     let off = ((y * w + x0) * 4) as usize;
@@ -299,7 +283,7 @@ impl Renderer {
                 }
             }
 
-            // 2) GDI 裁剪到 damage，只重绘相交卡片（未相交卡片像素保持上一帧）
+            // 2) GDI 裁剪到 damage，只重绘相交卡片
             let clip = CreateRectRgn(rects[0].0, rects[0].1, rects[0].2, rects[0].3);
             if rects.len() > 1 {
                 let second = CreateRectRgn(rects[1].0, rects[1].1, rects[1].2, rects[1].3);
@@ -319,14 +303,14 @@ impl Renderer {
             SelectClipRgn(mem_dc, None);
             let _ = DeleteObject(clip.into());
 
-            // 3) damage 内写入 per-pixel alpha（圆角 + 扁平描边）
+            // 3) damage 内写入 per-pixel alpha（SDF 抗锯齿圆角 + 1px 亮色描边）
             let card_rects: Vec<(i32, i32, i32, i32)> = cards
                 .iter()
                 .map(|c| (c.x, c.y, c.width, c.height))
                 .collect();
             self.blend_cards(&card_rects, &rects, alpha, CARD_RADIUS);
 
-            // 4) 提交（窗口范围 = 全部卡片包围盒，与全量渲染一致）
+            // 4) 提交（窗口范围 = 全部卡片包围盒）
             let bbox = compute_bbox(cards);
             let (ox, oy, cw, ch) = match bbox {
                 Some((x0, y0, x1, y1)) => {
@@ -348,15 +332,8 @@ impl Renderer {
             let size = SIZE { cx: cw, cy: ch };
             let dst_pt = POINT { x: ox, y: oy };
             let _ = UpdateLayeredWindow(
-                hwnd,
-                None,
-                Some(&dst_pt),
-                Some(&size),
-                Some(mem_dc),
-                Some(&src_pt),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
+                hwnd, None, Some(&dst_pt), Some(&size), Some(mem_dc), Some(&src_pt),
+                COLORREF(0), Some(&blend), ULW_ALPHA,
             );
         }
     }
@@ -374,7 +351,6 @@ impl Renderer {
             FillRect(mem_dc, &rect, brush);
             DeleteObject(brush.into());
 
-            // 标题文字居中
             let old_font = SelectObject(mem_dc, self.title_font.into());
             SetTextColor(mem_dc, rgb(238, 240, 246));
             let hint: Vec<u16> = "桌面已隐藏 · 双击这里恢复".encode_utf16().collect();
@@ -385,13 +361,17 @@ impl Renderer {
         }
     }
 
-    /// 绘制单张卡片（扁平化：左对齐标题 + 强调圆点 + 分隔线 + 右上角按钮区）
+    /// 绘制单张卡片：随卡片宽度等比缩放；
+    /// 标题栏有独立背景 + 分隔线 + 强调圆点 + 左对齐标题 + 数量徽标 + 右上角按钮区
     fn draw_card(&self, mem_dc: HDC, card: &Card, items: &[DesktopItem], ci: usize, show_icons: bool, selected: Option<(usize, usize)>) {
         unsafe {
+            let s = card_scale(card.width);
             let x = card.x;
             let y = card.y;
             let right = card.x + card.width;
             let bottom = card.y + card.height;
+            let th = title_h(card.width).max(24);
+            let ct = content_top(card.width);
 
             // 背景
             let (br, bg, bb) = lighten(self.bg_color, 1.0);
@@ -400,40 +380,61 @@ impl Renderer {
             FillRect(mem_dc, &rect, bg_brush);
             DeleteObject(bg_brush.into());
 
-            // 标题栏分隔线（扁平细节）
-            let (lr, lg, lb) = lighten(self.bg_color, 1.25);
+            // 标题栏独立背景（略亮一档，区分于内容区）
+            let (hr, hg, hb) = lighten(self.bg_color, 1.08);
+            let hdr_brush = CreateSolidBrush(rgb(hr, hg, hb));
+            let hdr_rect = RECT { left: x, top: y, right, bottom: y + th };
+            FillRect(mem_dc, &hdr_rect, hdr_brush);
+            DeleteObject(hdr_brush.into());
+
+            // 标题栏底色带（顶部高光）、底部分隔线
+            let (lr, lg, lb) = lighten(self.bg_color, 1.35);
             let line_brush = CreateSolidBrush(rgb(lr, lg, lb));
-            let line_rect = RECT { left: x + 12, top: y + TITLE_H - 2, right: x + card.width - 12, bottom: y + TITLE_H - 1 };
+            let lx = (12.0 * s) as i32;
+            let line_rect = RECT { left: x + lx, top: y + th - 2, right: x + card.width - lx, bottom: y + th - 1 };
             FillRect(mem_dc, &line_rect, line_brush);
             DeleteObject(line_brush.into());
 
-            // 左侧强调圆点（NULL_PEN 避免描边）
-            let dot_brush = CreateSolidBrush(rgb(86, 156, 214));
-            let old_pen = SelectObject(mem_dc, GetStockObject(NULL_PEN));
-            let _ = Ellipse(mem_dc, x + 14, y + 13, x + 22, y + 21);
-            SelectObject(mem_dc, old_pen);
+            // 标题栏字体（缩放）
+            let title_pt = ((17.0 * s).max(11.0)) as i32;
+            let grid_pt = ((12.0 * s).max(9.0)) as i32;
+            let item_pt = ((15.0 * s).max(10.0)) as i32;
+            let title_font = make_font(title_pt, true);
+            let grid_font = make_font(grid_pt, false);
+            let item_font = make_font(item_pt, false);
+
+            // 左侧强调圆点
+            let (dr, dg, db) = (86, 156, 214);
+            let dot_brush = CreateSolidBrush(rgb(dr, dg, db));
+            let dot_old_pen = SelectObject(mem_dc, GetStockObject(NULL_PEN));
+            let _ = Ellipse(
+                mem_dc,
+                x + (14.0 * s) as i32, y + (13.0 * s) as i32,
+                x + (22.0 * s) as i32, y + (21.0 * s) as i32,
+            );
+            SelectObject(mem_dc, dot_old_pen);
             DeleteObject(dot_brush.into());
 
-            // 标题（左对齐）
-            let old_font = SelectObject(mem_dc, self.title_font.into());
+            // 标题（左对齐，随卡片缩放字号）
+            let old_font = SelectObject(mem_dc, title_font.into());
             SetTextColor(mem_dc, rgb(238, 240, 246));
             let title: Vec<u16> = card.title.encode_utf16().collect();
-            TextOutW(mem_dc, x + 28, y + 10, &title);
+            TextOutW(mem_dc, x + (28.0 * s) as i32, y + (10.0 * s) as i32, &title);
 
             // 数量徽标（小号灰字，右对齐到按钮区左侧）
-            let g_old_font = SelectObject(mem_dc, self.grid_font.into());
+            let g_old = SelectObject(mem_dc, grid_font.into());
             SetTextColor(mem_dc, rgb(150, 158, 175));
             let cnt = card.item_indices.len().to_string();
-            let cw: Vec<u16> = cnt.encode_utf16().collect();
+            let cw16: Vec<u16> = cnt.encode_utf16().collect();
             let mut sz = SIZE::default();
-            GetTextExtentPoint32W(mem_dc, &cw, &mut sz);
-            TextOutW(mem_dc, (right - 82 - sz.cx).max(x + 30), y + 14, &cw);
-            SelectObject(mem_dc, g_old_font);
+            GetTextExtentPoint32W(mem_dc, &cw16, &mut sz);
+            TextOutW(mem_dc, (right - (78.0 * s) as i32 - sz.cx).max(x + (30.0 * s) as i32), y + (14.0 * s) as i32, &cw16);
+            SelectObject(mem_dc, g_old);
 
             // 右上角 X 按钮
             SetTextColor(mem_dc, rgb(196, 132, 134));
             let x_w: Vec<u16> = "✕".encode_utf16().collect();
-            TextOutW(mem_dc, right - 26, y + 7, &x_w);
+            TextOutW(mem_dc, right - (26.0 * s) as i32, y + (7.0 * s) as i32, &x_w);
 
             // 样式切换按钮（X 左侧）：List 显示 ▦（点它切网格），Grid 显示 ≡（点它切列表）
             SetTextColor(mem_dc, rgb(152, 164, 188));
@@ -441,21 +442,26 @@ impl Renderer {
                 CardStyle::Grid => "≡".encode_utf16().collect(),
                 CardStyle::List => "▦".encode_utf16().collect(),
             };
-            TextOutW(mem_dc, right - 54, y + 7, &style_icon);
+            TextOutW(mem_dc, right - (54.0 * s) as i32, y + (7.0 * s) as i32, &style_icon);
             SelectObject(mem_dc, old_font);
 
-            // 内容区
+            // 内容区（随卡片缩放）
             let content_bottom = bottom - 8;
+            let cw = cell_w(card.width).max(1);
+            let ch = cell_h(card.width).max(1);
             match card.style {
                 CardStyle::Grid => {
-                    let cols = ((card.width - 16) / CELL_W).max(1);
-                    let start_x = x + 8;
-                    let start_y = y + CONTENT_TOP;
-                    let rows_visible = ((content_bottom - start_y) / CELL_H).max(1);
+                    let cols = ((card.width - 16) / cw).max(1);
+                    let start_x = x + (8.0 * s) as i32;
+                    let start_y = y + ct;
+                    let rows_visible = ((content_bottom - start_y) / ch).max(1);
                     let total = card.item_indices.len() as i32;
                     let total_rows = ((total + cols - 1) / cols).max(1);
                     let max_scroll = (total_rows - rows_visible).max(0);
                     let scroll = card.scroll.clamp(0, max_scroll);
+                    // 图标尺寸随卡片缩放（上限受单元高约束，给名字留空间）
+                    let icon_sz = ((32.0 * s).max(20.0)).min((ch as f32 * 0.55) as f32) as i32;
+                    let name_gap = (6.0 * s) as i32;
                     for (ii, &idx) in card.item_indices.iter().enumerate() {
                         let i = ii as i32;
                         let row_global = i / cols;
@@ -464,24 +470,29 @@ impl Renderer {
                         }
                         let row = row_global - scroll;
                         let col = i % cols;
-                        let gx = start_x + col * CELL_W;
-                        let gy = start_y + row * CELL_H;
-                        if gy + CELL_H > content_bottom {
+                        let gx = start_x + col * cw;
+                        let gy = start_y + row * ch;
+                        if gy + ch > content_bottom {
                             break;
                         }
                         if let Some(it) = items.get(idx) {
                             if selected == Some((ci, ii)) {
                                 let sel_brush = CreateSolidBrush(rgb(58, 86, 132));
-                                let sel_rect = RECT { left: gx, top: gy, right: gx + CELL_W - 4, bottom: gy + CELL_H - 2 };
+                                let sel_rect = RECT { left: gx, top: gy, right: gx + cw - 4, bottom: gy + ch - 2 };
                                 FillRect(mem_dc, &sel_rect, sel_brush);
                                 DeleteObject(sel_brush.into());
                             }
+                            // 图标（无图标时用首字符占位，避免"空白"）
+                            let icon_x = gx + (cw - icon_sz) / 2;
+                            let icon_y = gy + (6.0 * s) as i32;
                             if let Some(icon) = it.icon {
-                                let _ = DrawIconEx(mem_dc, gx + (CELL_W - 32) / 2, gy + 6, icon, 32, 32, 0, None, DI_NORMAL);
+                                let _ = DrawIconEx(mem_dc, icon_x, icon_y, icon, icon_sz, icon_sz, 0, None, DI_NORMAL);
+                            } else {
+                                draw_fallback_badge(mem_dc, icon_x, icon_y, icon_sz, it, x + y);
                             }
-                            let g_old = SelectObject(mem_dc, self.grid_font.into());
-                            SetTextColor(mem_dc, rgb(218, 222, 232));
                             // 名字截断（超格宽显示 …），图标下方居中
+                            let g_old = SelectObject(mem_dc, grid_font.into());
+                            SetTextColor(mem_dc, rgb(218, 222, 232));
                             let short: String = it.display_name.chars().take(6).collect();
                             let mut t: Vec<u16> = short.encode_utf16().collect();
                             if it.display_name.chars().count() > 6 {
@@ -489,30 +500,32 @@ impl Renderer {
                             }
                             let mut tsz = SIZE::default();
                             GetTextExtentPoint32W(mem_dc, &t, &mut tsz);
-                            TextOutW(mem_dc, gx + ((CELL_W - 4 - tsz.cx) / 2).max(2), gy + 42, &t);
+                            TextOutW(mem_dc, gx + ((cw - 4 - tsz.cx) / 2).max(2), gy + icon_sz + name_gap, &t);
                             SelectObject(mem_dc, g_old);
                         }
                     }
                     // 滚动条（扁平：仅滑块）
                     if max_scroll > 0 {
-                        let sb_x = right - 10;
-                        let sb_top = y + CONTENT_TOP;
+                        let sb_x = right - (10.0 * s) as i32;
+                        let sb_top = y + ct;
                         let sb_h = (content_bottom - sb_top).max(20);
                         let thumb_h = ((rows_visible as f32 / total_rows as f32) * sb_h as f32).max(16.0) as i32;
                         let thumb_y = sb_top + ((scroll as f32 / max_scroll as f32) * (sb_h - thumb_h) as f32) as i32;
                         let thumb_brush = CreateSolidBrush(rgb(130, 140, 165));
-                        let th_rect = RECT { left: sb_x, top: thumb_y, right: sb_x + 5, bottom: thumb_y + thumb_h };
+                        let thw = ((5.0 * s) as i32).max(3);
+                        let th_rect = RECT { left: sb_x, top: thumb_y, right: sb_x + thw, bottom: thumb_y + thumb_h };
                         FillRect(mem_dc, &th_rect, thumb_brush);
                         DeleteObject(thumb_brush.into());
                     }
                 }
                 CardStyle::List => {
-                    let row_h = if show_icons { 26 } else { 22 };
-                    let visible_rows = ((content_bottom - y - CONTENT_TOP) / row_h).max(1);
+                    let rh = row_h(card.width, show_icons).max(1);
+                    let visible_rows = ((content_bottom - y - ct) / rh).max(1);
                     let total = card.item_indices.len() as i32;
                     let max_scroll = (total - visible_rows).max(0);
                     let scroll = card.scroll.clamp(0, max_scroll);
-                    let mut py = y + CONTENT_TOP;
+                    let icon_sz = (16.0 * s) as i32;
+                    let mut py = y + ct;
                     for (ii, &idx) in card.item_indices.iter().enumerate() {
                         if (ii as i32) < scroll {
                             continue;
@@ -523,43 +536,51 @@ impl Renderer {
                         if let Some(it) = items.get(idx) {
                             if selected == Some((ci, ii)) {
                                 let sel_brush = CreateSolidBrush(rgb(58, 86, 132));
-                                let sel_rect = RECT { left: x + 4, top: py - 1, right: right - 10, bottom: py + row_h - 1 };
+                                let sel_rect = RECT { left: x + 4, top: py - 1, right: right - (10.0 * s) as i32, bottom: py + rh - 1 };
                                 FillRect(mem_dc, &sel_rect, sel_brush);
                                 DeleteObject(sel_brush.into());
                             }
-                            let l_old = SelectObject(mem_dc, self.item_font.into());
+                            let l_old = SelectObject(mem_dc, item_font.into());
                             SetTextColor(mem_dc, rgb(218, 222, 232));
                             if show_icons {
+                                let iy = py + ((rh - icon_sz) / 2);
                                 if let Some(icon) = it.icon {
-                                    let _ = DrawIconEx(mem_dc, x + 12, py + 3, icon, 16, 16, 0, None, DI_NORMAL);
+                                    let _ = DrawIconEx(mem_dc, x + (12.0 * s) as i32, iy, icon, icon_sz, icon_sz, 0, None, DI_NORMAL);
+                                } else {
+                                    draw_fallback_badge(mem_dc, x + (12.0 * s) as i32, iy, icon_sz, it, x + y);
                                 }
                                 let line_w: Vec<u16> = it.display_name.encode_utf16().collect();
-                                TextOutW(mem_dc, x + 34, py + 3, &line_w);
+                                TextOutW(mem_dc, x + (34.0 * s) as i32, iy, &line_w);
                             } else {
                                 let line_w: Vec<u16> = it.display_name.encode_utf16().collect();
-                                TextOutW(mem_dc, x + 12, py + 3, &line_w);
+                                TextOutW(mem_dc, x + (12.0 * s) as i32, py + ((rh - item_pt) / 2), &line_w);
                             }
                             SelectObject(mem_dc, l_old);
                         }
-                        py += row_h;
+                        py += rh;
                     }
                     if max_scroll > 0 {
-                        let sb_x = right - 10;
-                        let sb_top = y + CONTENT_TOP;
+                        let sb_x = right - (10.0 * s) as i32;
+                        let sb_top = y + ct;
                         let sb_h = (content_bottom - sb_top).max(20);
                         let thumb_h = ((visible_rows as f32 / total as f32) * sb_h as f32).max(16.0) as i32;
                         let thumb_y = sb_top + ((scroll as f32 / max_scroll as f32) * (sb_h - thumb_h) as f32) as i32;
                         let thumb_brush = CreateSolidBrush(rgb(130, 140, 165));
-                        let th_rect = RECT { left: sb_x, top: thumb_y, right: sb_x + 5, bottom: thumb_y + thumb_h };
+                        let thw = ((5.0 * s) as i32).max(3);
+                        let th_rect = RECT { left: sb_x, top: thumb_y, right: sb_x + thw, bottom: thumb_y + thumb_h };
                         FillRect(mem_dc, &th_rect, thumb_brush);
                         DeleteObject(thumb_brush.into());
                     }
                 }
             }
+
+            DeleteObject(title_font.into());
+            DeleteObject(grid_font.into());
+            DeleteObject(item_font.into());
         }
     }
 
-    /// 在 damage 区域内为卡片矩形 (x, y, w, h) 写入 per-pixel alpha：圆角裁形 + 1px 亮色描边（扁平）
+    /// 在 damage 区域内为卡片矩形 (x, y, w, h) 写入 per-pixel alpha：SDF 抗锯齿圆角 + 1px 亮色描边
     /// 数组顺序即层级：后画的卡片覆盖先画的（与绘制顺序一致）
     fn blend_cards(&self, rects: &[(i32, i32, i32, i32)], damage: &[(i32, i32, i32, i32)], alpha: u8, radius: i32) {
         let w = self.w;
@@ -570,6 +591,8 @@ impl Renderer {
         let data = self.bits as *mut u8;
         let (bdr, bdg, bdb) = lighten(self.bg_color, 1.5);
         let border_alpha = alpha.saturating_add(45);
+        let bw = 0.9_f32; // 描边宽度（像素）
+        unsafe {
         for &(rx, ry, rw, rh) in rects {
             let cx0 = rx.max(0);
             let cy0 = ry.max(0);
@@ -578,6 +601,11 @@ impl Renderer {
             if cx1 <= cx0 || cy1 <= cy0 {
                 continue;
             }
+            let r = (radius as f32).clamp(0.0, ((cx1 - cx0) as f32 / 2.0).min((cy1 - cy0) as f32 / 2.0));
+            let fcx0 = cx0 as f32;
+            let fcy0 = cy0 as f32;
+            let fcx1 = cx1 as f32;
+            let fcy1 = cy1 as f32;
             for &(dx0, dy0, dx1, dy1) in damage {
                 let rx0 = cx0.max(dx0);
                 let ry0 = cy0.max(dy0);
@@ -587,35 +615,57 @@ impl Renderer {
                     continue;
                 }
                 for y in ry0..ry1 {
-                    let Some((xs, xe)) = rounded_row(y, cx0, cy0, cx1, cy1, radius) else { continue };
+                    let Some((xs, xe)) = rounded_row(y, cx0, cy0, cx1, cy1, r as i32) else { continue };
                     let xs = xs.max(rx0);
                     let xe = xe.min(rx1);
                     if xe <= xs {
                         continue;
                     }
-                    // 圆角带（顶/底各 radius 行）整行视作描边；中部行首尾 1px 描边
-                    let corner_band = y < cy0 + radius || y > cy1 - 1 - radius;
                     let row = (y * w) as usize;
-                    if corner_band {
-                        for x in xs..xe {
-                            let off = (row + x as usize) * 4;
-                            unsafe {
-                                *data.add(off) = bdb;
-                                *data.add(off + 1) = bdg;
-                                *data.add(off + 2) = bdr;
-                                *data.add(off + 3) = border_alpha;
-                            }
-                        }
-                    } else {
-                        for x in xs..xe {
-                            let off = (row + x as usize) * 4;
-                            let a = if x == xs || x == xe - 1 { border_alpha } else { alpha };
-                            unsafe { *data.add(off + 3) = a; }
+                    let py = y as f32 + 0.5;
+                    for x in xs..xe {
+                        let sd = rounded_sd(x as f32 + 0.5, py, fcx0, fcy0, fcx1, fcy1, r);
+                        let off = (row + x as usize) * 4;
+                        if sd < -bw {
+                            // 纯内部：保留绘制内容，只设透明度
+                            *data.add(off + 3) = alpha;
+                        } else {
+                            // 描边环 + 抗锯齿过渡
+                            let cov = (0.5 - sd).clamp(0.0, 1.0);
+                            let a = (border_alpha as f32 * cov) as u8;
+                            *data.add(off) = bdb;
+                            *data.add(off + 1) = bdg;
+                            *data.add(off + 2) = bdr;
+                            *data.add(off + 3) = a;
                         }
                     }
                 }
             }
         }
+        }
+    }
+}
+
+/// 无图标时的占位徽标：圆角方块 + 首字符（避免"很多图标空白"）
+fn draw_fallback_badge(mem_dc: HDC, x: i32, y: i32, sz: i32, it: &DesktopItem, _seed: i32) {
+    unsafe {
+        let s = sz.max(12);
+        let brush = CreateSolidBrush(rgb(86, 156, 214));
+        let rect = RECT { left: x, top: y, right: x + s, bottom: y + s };
+        let pen_old = SelectObject(mem_dc, GetStockObject(NULL_PEN));
+        FillRect(mem_dc, &rect, brush);
+        SelectObject(mem_dc, pen_old);
+        DeleteObject(brush.into());
+        // 首字符白字居中
+        let ch: Vec<u16> = it.display_name.chars().next().map(|c| c.to_string()).unwrap_or_else(|| "?".into()).encode_utf16().collect();
+        let f = make_font((s as f32 * 0.5) as i32, true);
+        let old = SelectObject(mem_dc, f.into());
+        SetTextColor(mem_dc, rgb(238, 240, 246));
+        let mut tsz = SIZE::default();
+        GetTextExtentPoint32W(mem_dc, &ch, &mut tsz);
+        TextOutW(mem_dc, x + (s - tsz.cx) / 2, y + (s - tsz.cy) / 2, &ch);
+        SelectObject(mem_dc, old);
+        DeleteObject(f.into());
     }
 }
 
