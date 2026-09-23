@@ -720,14 +720,20 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                         }
                     }
                 } else if let Some(tci) = layout::hit_test_title(&s.cards, x, y) {
-                    // 双击标题栏 → 重命名分区（标题栏可直接修改）
+                    // 双击标题栏 → 重命名分区（标题栏可直接修改）。
+                    // 先结束首击可能残留的拖拽/鼠标捕获，避免模态对话框受捕获干扰误触退出/误动卡片。
+                    s.drag = None;
+                    unsafe { ReleaseCapture(); }
                     let cur = s.cards.get(tci).map(|c| c.title.clone()).unwrap_or_default();
                     if let Some(name) = rename_card(hwnd, &cur) {
                         if let Some(card) = s.cards.get_mut(tci) {
-                            card.title = name;
+                            if !name.trim().is_empty() {
+                                card.title = name;
+                            }
                         }
                         s.renderer.render(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
                     }
+                    return LRESULT(0);
                 } else if s.settings.double_click_hide && layout::hit_test(&s.cards, x, y).is_none() {
                     // 双击卡片外空白 → 隐藏/显示
                     s.visible = !s.visible;

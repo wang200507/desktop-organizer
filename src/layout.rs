@@ -8,8 +8,8 @@ pub const TITLE_H: i32 = 36;
 /// 基准内容区顶部（标题栏 + 分隔线以下）
 pub const CONTENT_TOP: i32 = 42;
 /// 基准网格单元尺寸
-pub const CELL_W: i32 = 96;
-pub const CELL_H: i32 = 74;
+pub const CELL_W: i32 = 48;
+pub const CELL_H: i32 = 64;
 
 /// 卡片 UI 缩放比例（基于卡片宽度，基准 BASE_W，范围 0.8~3.0）
 /// 卡片放大时标题栏/按钮/数量/图标等比放大
@@ -24,12 +24,21 @@ pub fn title_h(width: i32) -> i32 {
 pub fn content_top(width: i32) -> i32 {
     (CONTENT_TOP as f32 * card_scale(width)) as i32
 }
-/// 缩放后的网格单元尺寸
+/// 网格列数：自适应铺满卡片宽度（拉宽卡片时列数随之增加，缩短纵向滚动）
+pub fn grid_cols(width: i32) -> i32 {
+    let avail = width - 16;
+    // 单元宽随缩放微涨但封顶 2x，列数随可用宽度自适应（2~10 列）
+    let s = card_scale(width).min(2.0);
+    let cw = (CELL_W as f32 * s).max(1.0) as i32;
+    (avail / cw).clamp(2, 10)
+}
+/// 缩放后的网格单元尺寸：列宽铺满、行高自适应
 pub fn cell_w(width: i32) -> i32 {
-    (CELL_W as f32 * card_scale(width)) as i32
+    let avail = width - 16;
+    (avail / grid_cols(width)).max(1)
 }
 pub fn cell_h(width: i32) -> i32 {
-    (CELL_H as f32 * card_scale(width)) as i32
+    (CELL_H as f32 * card_scale(width)).clamp(44.0, 120.0) as i32
 }
 /// 缩放后的列表行高
 pub fn row_h(width: i32, show_icons: bool) -> i32 {
@@ -182,7 +191,7 @@ pub fn hit_test_item(cards: &[Card], x: i32, y: i32, show_icons: bool) -> Option
             CardStyle::Grid => {
                 let cw = cell_w(card.width);
                 let ch = cell_h(card.width);
-                let cols = ((card.width - 16) / cw).max(1);
+                let cols = grid_cols(card.width);
                 let col = (x - card.x - mid) / cw;
                 let row = (y - card.y - content_top(card.width)) / ch;
                 let idx = ((row + card.scroll) * cols + col) as usize;

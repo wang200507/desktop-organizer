@@ -157,7 +157,7 @@ impl Renderer {
                 CardStyle::Grid => {
                     let cw = cell_w(card.width).max(1);
                     let ch = cell_h(card.width).max(1);
-                    let cols = ((card.width - 16) / cw).max(1);
+                    let cols = crate::layout::grid_cols(card.width);
                     let rows_visible = ((content_bottom - card.y - content_top(card.width)) / ch).max(1);
                     let total_rows = ((card.item_indices.len() as i32 + cols - 1) / cols).max(1);
                     (total_rows - rows_visible).max(0)
@@ -250,9 +250,27 @@ impl Renderer {
         }
     }
 
+    /// 是否存在卡片相互重叠（重叠时局部 damage 重绘会破坏被盖住卡片，需退化到全量渲染）
+    fn cards_overlap(cards: &[Card]) -> bool {
+        for i in 0..cards.len() {
+            let a = &cards[i];
+            for b in cards.iter().skip(i + 1) {
+                if a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// 局部渲染：只清空/重绘 damage 区域（滚动、选中切换用，避免全屏重绘卡顿）
     pub fn render_damage(&mut self, hwnd: HWND, cards: &mut [Card], items: &[DesktopItem], visible: bool, alpha: u8, show_icons: bool, selected: Option<(usize, usize)>, damage: &[(i32, i32, i32, i32)]) {
         if !visible {
+            self.render(hwnd, cards, items, visible, alpha, show_icons, selected);
+            return;
+        }
+        // 有重叠时直接全量渲染：局部清空只覆盖重叠区域，会把被挡住卡片的内容/alpha 清成空白
+        if Self::cards_overlap(cards) {
             self.render(hwnd, cards, items, visible, alpha, show_icons, selected);
             return;
         }
@@ -409,35 +427,10 @@ impl Renderer {
             let grid_font = make_font(grid_pt, false);
             let item_font = make_font(item_pt, false);
 
-            // 标题栏图标：圆角应用块 + 分区首字符（替代原圆点，更清晰）
-            let tile = (18.0 * s) as i32;
+            // 标题栏图标：扁平文件夹（参照上传示意图），随卡片缩放
+            let tile = (20.0 * s) as i32;
             let tile_top = y + (th - tile).max(0) / 2;
-            let tpen = CreatePen(PS_NULL, 0, rgb(0, 0, 0));
-            let tbr = CreateSolidBrush(rgb(86, 156, 214));
-            let tpo = SelectObject(mem_dc, tpen.into());
-            let tbo = SelectObject(mem_dc, tbr.into());
-            let _ = RoundRect(
-                mem_dc,
-                x + (12.0 * s) as i32, tile_top,
-                x + (12.0 * s) as i32 + tile, tile_top + tile,
-                (6.0 * s) as i32, (6.0 * s) as i32,
-            );
-            SelectObject(mem_dc, tbo);
-            SelectObject(mem_dc, tpo);
-            DeleteObject(tbr.into());
-            DeleteObject(tpen.into());
-            let first_c: Vec<u16> = card.title.chars().next().unwrap_or('□').to_string().encode_utf16().collect();
-            let chip_font = make_font(((11.0 * s).max(8.0)) as i32, true);
-            let cf_old = SelectObject(mem_dc, chip_font.into());
-            SetBkMode(mem_dc, TRANSPARENT);
-            SetTextColor(mem_dc, rgb(255, 255, 255));
-            {
-                let mut fab = SIZE::default();
-                GetTextExtentPoint32W(mem_dc, &first_c, &mut fab);
-                TextOutW(mem_dc, x + (12.0 * s) as i32 + (tile - fab.cx) / 2, tile_top + (tile - fab.cy) / 2, &first_c);
-            }
-            SelectObject(mem_dc, cf_old);
-            DeleteObject(chip_font.into());
+            draw_folder_icon(mem_dc, x + (10.0 * s) as i32, tile_top, tile);
 
             // 统一垂直基线：以 title 带高 th 为中轴，各元素按参考字高居中
             let title_ref = (17.0 * s) as i32; // 标题字形参考高
@@ -480,7 +473,7 @@ impl Renderer {
             let ch = cell_h(card.width).max(1);
             match card.style {
                 CardStyle::Grid => {
-                    let cols = ((card.width - 16) / cw).max(1);
+                    let cols = crate::layout::grid_cols(card.width);
                     let start_x = x + (8.0 * s) as i32;
                     let start_y = y + ct;
                     let rows_visible = ((content_bottom - start_y) / ch).max(1);
@@ -488,8 +481,8 @@ impl Renderer {
                     let total_rows = ((total + cols - 1) / cols).max(1);
                     let max_scroll = (total_rows - rows_visible).max(0);
                     let scroll = card.scroll.clamp(0, max_scroll);
-                    // 图标尺寸随卡片缩放（上限受单元高约束，给名字留空间）
-                    let icon_sz = ((32.0 * s).max(20.0)).min((ch as f32 * 0.55) as f32) as i32;
+                    // 图标尺寸随卡片缩放（上限受单元宽/高约束，给名字留空间）
+                    let icon_sz = ((32.0 * s).max(18.0)).min((cw as f32 * 0.78) as f32).min((ch as f32 * 0.55) as f32) as i32;
                     let name_gap = (6.0 * s) as i32;
                     for (ii, &idx) in card.item_indices.iter().enumerate() {
                         let i = ii as i32;
@@ -699,6 +692,47 @@ fn draw_fallback_badge(mem_dc: HDC, x: i32, y: i32, sz: i32, it: &DesktopItem, _
         TextOutW(mem_dc, x + (s - tsz.cx) / 2, y + (s - tsz.cy) / 2, &ch);
         SelectObject(mem_dc, old);
         DeleteObject(f.into());
+    }
+}
+
+/// 扁平文件夹图标（参照上传示意图）：亮青文件夹体 + 深色标签条（顶部左侧、右缘斜切 + 前缘高光折页）
+fn draw_folder_icon(mem_dc: HDC, ox: i32, oy: i32, fl: i32) {
+    unsafe {
+        let w = fl.max(8);
+        let pen_stock = GetStockObject(NULL_PEN);
+        let pen_old = SelectObject(mem_dc, pen_stock);
+        // 文件夹体：主背景圆角矩形
+        let body_brush = CreateSolidBrush(rgb(70, 176, 245));
+        let body_old = SelectObject(mem_dc, body_brush.into());
+        let bty = oy + (w as f32 * 0.18) as i32;
+        let bh = (fl - (w as f32 * 0.18) as i32).max(6);
+        let _ = RoundRect(mem_dc, ox, bty, ox + w, bty + bh, w / 3, w / 3);
+        SelectObject(mem_dc, body_old);
+        DeleteObject(body_brush.into());
+        // 前缘折页：顶部一条稍亮的圆角条，增强层次
+        let fold_brush = CreateSolidBrush(rgb(128, 208, 252));
+        let fold_old = SelectObject(mem_dc, fold_brush.into());
+        let fh = ((w as f32 * 0.24) as i32).max(3);
+        let _ = RoundRect(mem_dc, ox, bty - 1, ox + w, (bty + fh).min(bty + bh), w / 3, w / 3);
+        SelectObject(mem_dc, fold_old);
+        DeleteObject(fold_brush.into());
+        // 标签条：顶部左侧，右缘斜切，深色
+        let tab_brush = CreateSolidBrush(rgb(88, 100, 122));
+        let tab_old = SelectObject(mem_dc, tab_brush.into());
+        let tx = ox + (w as f32 * 0.05) as i32;
+        let tt = oy;
+        let tw = (w as f32 * 0.34) as i32;
+        let thh = (w as f32 * 0.20) as i32;
+        let pts = [
+            POINT { x: tx, y: tt },
+            POINT { x: tx + tw, y: tt },
+            POINT { x: tx + tw + thh / 2, y: tt + thh },
+            POINT { x: tx, y: tt + thh },
+        ];
+        let _ = Polygon(mem_dc, &pts);
+        SelectObject(mem_dc, tab_old);
+        DeleteObject(tab_brush.into());
+        SelectObject(mem_dc, pen_old);
     }
 }
 
