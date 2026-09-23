@@ -1,3 +1,4 @@
+#![windows_subsystem = "windows"] // GUI 子系统：不再弹出/停在任务栏的控制台窗口
 mod layout;
 mod renderer;
 mod scanner;
@@ -488,7 +489,7 @@ fn main() {
 
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_LAYERED,
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class_name,
             w!("桌面图标整理"),
             WS_POPUP,
@@ -531,29 +532,12 @@ fn main() {
                 }
                 Err(_) => {}
             }
-            // v0.4.5 挂入桌面层：SetParent 到 SHELLDLL_DefView 的父窗口（本机=Progman）。
-            // 成为桌面子窗口后：Win+D/显示桌面不再收起卡片；普通应用窗口永远在卡片之上
-            // （此前顶层窗口被 WM_TIMER 的 SW_SHOW 激活置顶——"卡片跑到其他窗口上面"根因）。
-            match GetParent(defview) {
-                Ok(parent) if !parent.is_invalid() => {
-                    // WS_POPUP → WS_CHILD：先改样式再挂父
-                    let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-                    let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, (style & !(WS_POPUP.0 as isize)) | WS_CHILD.0 as isize);
-                    if let Err(e) = SetParent(hwnd, Some(parent)) {
-                        error_log(&format!("SetParent 失败 {}", e));
-                    } else {
-                        // 子窗口坐标 = 屏幕坐标 - 父客户区原点（多屏副屏在左侧时原点为负）
-                        let mut org = POINT { x: 0, y: 0 };
-                        let _ = ClientToScreen(parent, &mut org);
-                        // 排到 DefView 之上：卡片像素(alpha>0)可点击，空白像素(alpha=0)透传给 DefView
-                        let _ = SetWindowPos(hwnd, Some(HWND_TOP), -org.x, -org.y, 0, 0,
-                            SET_WINDOW_POS_FLAGS(0x0001 | 0x0010 | 0x0020)); // SWP_NOSIZE|SWP_NOACTIVATE|SWP_FRAMECHANGED
-                    }
-                }
-                _ => error_log("桌面层挂接失败：GetParent(DefView) 无效"),
-            }
+            // v0.4.5 曾 SetParent 挂入 Progman 桌面层以固定 z 序，但 UpdateLayeredWindow
+            // 只支持顶层窗口，挂父后强制 WS_CHILD 导致渲染完全失效（卡片不显示）。
+            // 回退到顶层分层窗口：靠 WS_EX_TOOLWINDOW+WS_EX_NOACTIVATE 实现"不进任务栏、
+            // 永不抢占前台"；Win+D 收起由 WM_SHOWWINDOW 兜底用 SW_SHOWNOACTIVATE 恢复。
         }
-        ShowWindow(hwnd, SW_SHOW);
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         UpdateWindow(hwnd);
         // 显式首次渲染（分层窗口不走 WM_PAINT，避免重启后空白需点击才出现）
         if let Some(s) = get_state(hwnd) {
@@ -1130,19 +1114,20 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             if wp.0 == TIMER_ID {
                 // 最小化窗口 IsWindowVisible 仍为 TRUE，须额外判 IsIconic
                 if unsafe { IsIconic(hwnd).as_bool() } {
-                    unsafe { ShowWindow(hwnd, SW_RESTORE) };
+                    unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
                 } else if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
-                    unsafe { ShowWindow(hwnd, SW_SHOW) };
+                    unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
                 }
             }
             LRESULT(0)
         }
         WM_SHOWWINDOW => {
-            // 拦截被隐藏（如 Win+D 显示桌面会把顶层窗口最小化）：卡片保持可见
+            // 拦截被隐藏（如 Win+D 显示桌面会把顶层窗口最小化）：卡片保持可见。
+            // 用 SW_SHOWNOACTIVATE 恢复，避免激活置顶到普通应用窗口之上。
             if wp.0 == 0 {
                 if let Some(s) = get_state(hwnd) {
                     if s.visible {
-                        unsafe { ShowWindow(hwnd, SW_SHOW) };
+                        unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
                     }
                 }
             }
