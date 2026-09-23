@@ -132,18 +132,20 @@ pub fn hit_test(cards: &[Card], x: i32, y: i32) -> Option<usize> {
 }
 
 /// 命中测试：判断坐标是否落在卡片的右上角 X 按钮
+/// z 序正确：只考虑坐标处的最顶层卡片（避免点到被上层卡片盖住的 X 误删）
 pub fn hit_test_close(cards: &[Card], x: i32, y: i32) -> Option<usize> {
-    for (i, card) in cards.iter().enumerate().rev() {
-        let s = card_scale(card.width);
-        let orth = (16.0 * s) as i32;
-        let off = (12.0 * s) as i32;
-        let cx = card.x + card.width - orth;
-        let cy = card.y + off;
-        if x >= cx - off && x < cx + off && y >= cy - off && y < cy + off {
-            return Some(i);
-        }
+    let i = hit_test(cards, x, y)?;
+    let card = &cards[i];
+    let s = card_scale(card.width);
+    let orth = (16.0 * s) as i32;
+    let off = (12.0 * s) as i32;
+    let cx = card.x + card.width - orth;
+    let cy = card.y + off;
+    if x >= cx - off && x < cx + off && y >= cy - off && y < cy + off {
+        Some(i)
+    } else {
+        None
     }
-    None
 }
 
 /// 拖拽调整大小的边缘类型
@@ -155,89 +157,97 @@ pub enum ResizeKind {
 }
 
 /// 命中测试：判断坐标是否落在卡片边缘（用于调整大小）
+/// z 序正确：只考虑坐标处的最顶层卡片
 pub fn hit_test_resize(cards: &[Card], x: i32, y: i32) -> Option<(usize, ResizeKind)> {
+    let i = hit_test(cards, x, y)?;
+    let card = &cards[i];
     const EDGE: i32 = 10;
     const CORNER: i32 = 20;
-    for (i, card) in cards.iter().enumerate().rev() {
-        let right = card.x + card.width;
-        let bottom = card.y + card.height;
-        // 右下角
-        if x >= right - CORNER && x < right && y >= bottom - CORNER && y < bottom {
-            return Some((i, ResizeKind::Corner));
-        }
-        // 右边缘
-        if x >= right - EDGE && x < right && y >= card.y && y < bottom {
-            return Some((i, ResizeKind::Right));
-        }
-        // 下边缘
-        if y >= bottom - EDGE && y < bottom && x >= card.x && x < right {
-            return Some((i, ResizeKind::Bottom));
-        }
+    let right = card.x + card.width;
+    let bottom = card.y + card.height;
+    // 右下角
+    if x >= right - CORNER && x < right && y >= bottom - CORNER && y < bottom {
+        return Some((i, ResizeKind::Corner));
+    }
+    // 右边缘
+    if x >= right - EDGE && x < right && y >= card.y && y < bottom {
+        return Some((i, ResizeKind::Right));
+    }
+    // 下边缘
+    if y >= bottom - EDGE && y < bottom && x >= card.x && x < right {
+        return Some((i, ResizeKind::Bottom));
     }
     None
 }
 
 /// 命中测试：判断坐标落在哪个卡片的哪个图标项（返回 (卡片索引, 项列表索引)）
+/// z 序正确：只考虑坐标处的最顶层卡片（避免点到被盖住卡片的内容误开文件）
 pub fn hit_test_item(cards: &[Card], x: i32, y: i32, show_icons: bool) -> Option<(usize, usize)> {
-    for (ci, card) in cards.iter().enumerate().rev() {
-        // 内容区（避开右侧按钮区，尺寸按卡片缩放）
-        let s = card_scale(card.width);
-        let rhs_btn = (28.0 * s) as i32;
-        let mid = (8.0 * s) as i32;
-        if x < card.x + mid || x >= card.x + card.width - rhs_btn || y < card.y + content_top(card.width) {
-            continue;
+    let ci = hit_test(cards, x, y)?;
+    let card = &cards[ci];
+    // 内容区（避开右侧按钮区，尺寸按卡片缩放）
+    let s = card_scale(card.width);
+    let rhs_btn = (28.0 * s) as i32;
+    let mid = (8.0 * s) as i32;
+    if x < card.x + mid || x >= card.x + card.width - rhs_btn || y < card.y + content_top(card.width) {
+        return None;
+    }
+    match card.style {
+        CardStyle::Grid => {
+            let cw = cell_w(card.width);
+            let ch = cell_h(card.width);
+            let cols = grid_cols(card.width);
+            let col = (x - card.x - mid) / cw;
+            let row = (y - card.y - content_top(card.width)) / ch;
+            let idx = ((row + card.scroll) * cols + col) as usize;
+            if idx < card.item_indices.len() {
+                Some((ci, idx))
+            } else {
+                None
+            }
         }
-        match card.style {
-            CardStyle::Grid => {
-                let cw = cell_w(card.width);
-                let ch = cell_h(card.width);
-                let cols = grid_cols(card.width);
-                let col = (x - card.x - mid) / cw;
-                let row = (y - card.y - content_top(card.width)) / ch;
-                let idx = ((row + card.scroll) * cols + col) as usize;
-                if idx < card.item_indices.len() {
-                    return Some((ci, idx));
+        CardStyle::List => {
+            let rh = row_h(card.width, show_icons);
+            let mut y_pos = card.y + content_top(card.width);
+            for (ii, _) in card.item_indices.iter().enumerate() {
+                if y >= y_pos && y < y_pos + rh {
+                    return Some((ci, ii));
                 }
+                y_pos += rh;
             }
-            CardStyle::List => {
-                let rh = row_h(card.width, show_icons);
-                let mut y_pos = card.y + content_top(card.width);
-                for (ii, _) in card.item_indices.iter().enumerate() {
-                    if y >= y_pos && y < y_pos + rh {
-                        return Some((ci, ii));
-                    }
-                    y_pos += rh;
-                }
-            }
+            None
         }
     }
-    None
 }
 
 /// 命中测试：判断坐标是否落在卡片的样式切换按钮（X 按钮左侧，用于网格/列表切换）
+/// z 序正确：只考虑坐标处的最顶层卡片
 pub fn hit_test_style(cards: &[Card], x: i32, y: i32) -> Option<usize> {
-    for (i, card) in cards.iter().enumerate().rev() {
-        let s = card_scale(card.width);
-        let sx = card.x + card.width - (52.0 * s) as i32; // X 按钮左侧
-        let sy = card.y + (12.0 * s) as i32;
-        let r = (12.0 * s) as i32;
-        if x >= sx - r && x < sx + r && y >= sy - r && y < sy + r {
-            return Some(i);
-        }
+    let i = hit_test(cards, x, y)?;
+    let card = &cards[i];
+    let s = card_scale(card.width);
+    let sx = card.x + card.width - (52.0 * s) as i32; // X 按钮左侧
+    let sy = card.y + (12.0 * s) as i32;
+    let r = (12.0 * s) as i32;
+    if x >= sx - r && x < sx + r && y >= sy - r && y < sy + r {
+        Some(i)
+    } else {
+        None
     }
-    None
 }
 
 /// 命中测试：判断坐标是否落在卡片标题栏（用于拖动移动 / 双击改名）
+/// z 序正确：只考虑坐标处的最顶层卡片
 pub fn hit_test_title(cards: &[Card], x: i32, y: i32) -> Option<usize> {
-    for (i, card) in cards.iter().enumerate().rev() {
-        let s = card_scale(card.width);
-        // 标题栏区域：卡片顶部 title_h，避开右侧按钮区
-        if x >= card.x && x < card.x + card.width - (28.0 * s) as i32 && y >= card.y && y < card.y + title_h(card.width) {
-            return Some(i);
-        }
+    let i = hit_test(cards, x, y)?;
+    let card = &cards[i];
+    let s = card_scale(card.width);
+    // 标题栏区域：卡片顶部 title_h，避开右侧按钮区
+    if x >= card.x && x < card.x + card.width - (28.0 * s) as i32 && y >= card.y && y < card.y + title_h(card.width) {
+        Some(i)
+    } else {
+        None
     }
-    None
 }
 
 #[derive(Serialize, Deserialize)]

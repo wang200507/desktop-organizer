@@ -14,9 +14,10 @@ use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcessId, OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    CreateMutexW, GetCurrentProcessId, OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+use windows::Win32::UI::Controls::Dialogs::{ChooseColorW, CHOOSECOLORW, CC_FULLOPEN, CC_RGBINIT};
 use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, IDYES, MB_YESNO,
 };
@@ -55,6 +56,8 @@ static RENAME_DLG: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static RENAME_VALUE: Mutex<String> = Mutex::new(String::new());
 static RENAME_ACCEPTED: AtomicBool = AtomicBool::new(false);
 static RENAME_DONE: AtomicBool = AtomicBool::new(false);
+/// 重命名对话框打开中（防重入：模态循环会继续分发主窗口消息，嵌套双击会踩坏全局句柄）
+static RENAME_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// 判断窗口是否属于"桌面区域"（我们的窗口 或 explorer 桌面层，排除任务栏/开始按钮/弹出菜单）
 fn is_desktop_area(hwnd_at: HWND) -> bool {
@@ -343,7 +346,8 @@ fn uninstall() {
     let _ = std::fs::remove_dir_all(data_dir());
     // 运行中的 exe 无法直接删除：标记重启后自动删除
     if let Ok(exe) = std::env::current_exe() {
-        let s: Vec<u16> = exe.to_string_lossy().encode_utf16().collect();
+        let mut s: Vec<u16> = exe.to_string_lossy().encode_utf16().collect();
+        s.push(0); // NUL 终止（缺终止符传给 Win32 属未定义行为）
         unsafe {
             let _ = MoveFileExW(
                 PCWSTR(s.as_ptr()),
@@ -444,6 +448,13 @@ fn main() {
             }
         }
         return;
+    }
+    // 单实例互斥：已有实例运行时直接退出（双实例会互相还原/隐藏桌面图标，导致
+    // "关闭一个后桌面图标与卡片同时出现"以及命中/渲染错乱），互斥体生命周期=进程。
+    // 注意：命名互斥体已存在时 CreateMutexW 返回有效句柄 + GetLastError=ERROR_ALREADY_EXISTS
+    let _single = unsafe { CreateMutexW(None, false, w!("DeskOrg::SingleInstance")) };
+    if _single.is_err() || unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        std::process::exit(0);
     }
     // 异常退出（panic）时兜底还原桌面图标 + 记录错误日志
     std::panic::set_hook(Box::new(|info| {
@@ -699,27 +710,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                     }
                     return LRESULT(0);
                 }
-                // 双击图标项 → 打开文件/快捷方式
-                if let Some((ci, ii)) = layout::hit_test_item(&s.cards, x, y, s.settings.show_icons) {
-                    if let Some(card) = s.cards.get(ci) {
-                        if let Some(&item_idx) = card.item_indices.get(ii) {
-                            if let Some(item) = s.items.get(item_idx) {
-                                let path_str = item.path.to_string_lossy();
-                                let path_w: Vec<u16> = path_str.encode_utf16().collect();
-                                unsafe {
-                                    ShellExecuteW(
-                                        None,
-                                        w!("open"),
-                                        PCWSTR(path_w.as_ptr()),
-                                        None,
-                                        None,
-                                        SW_SHOW,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                } else if let Some(tci) = layout::hit_test_title(&s.cards, x, y) {
+                // 双击标题栏 → 重命名分区（标题优先于图标项，避免几何边缘误开文件）
+                if let Some(tci) = layout::hit_test_title(&s.cards, x, y) {
                     // 双击标题栏 → 重命名分区（标题栏可直接修改）。
                     // 先结束首击可能残留的拖拽/鼠标捕获，避免模态对话框受捕获干扰误触退出/误动卡片。
                     s.drag = None;
@@ -734,6 +726,27 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                         s.renderer.render(hwnd, &mut s.cards, &s.items, s.visible, s.settings.alpha, s.settings.show_icons, s.selected);
                     }
                     return LRESULT(0);
+                } else if let Some((ci, ii)) = layout::hit_test_item(&s.cards, x, y, s.settings.show_icons) {
+                    // 双击图标项 → 打开文件/快捷方式
+                    if let Some(card) = s.cards.get(ci) {
+                        if let Some(&item_idx) = card.item_indices.get(ii) {
+                            if let Some(item) = s.items.get(item_idx) {
+                                let path_str = item.path.to_string_lossy();
+                                let mut path_w: Vec<u16> = path_str.encode_utf16().collect();
+                                path_w.push(0); // NUL 终止
+                                unsafe {
+                                    ShellExecuteW(
+                                        None,
+                                        w!("open"),
+                                        PCWSTR(path_w.as_ptr()),
+                                        None,
+                                        None,
+                                        SW_SHOW,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 } else if s.settings.double_click_hide && layout::hit_test(&s.cards, x, y).is_none() {
                     // 双击卡片外空白 → 隐藏/显示
                     s.visible = !s.visible;
@@ -837,8 +850,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                     }
                 }
                 0x1B => {
-                    // Esc 退出
-                    unsafe { DestroyWindow(hwnd) };
+                    // Esc：仅关闭设置窗口（若打开），不再直接退出程序（防误触）
+                    if let Some(s) = get_state(hwnd) {
+                        if let Some(sh) = s.settings_hwnd.take() {
+                            unsafe { DestroyWindow(sh) };
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1202,8 +1219,13 @@ unsafe extern "system" fn rename_edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp:
 unsafe extern "system" fn rename_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_COMMAND => {
+            // v0.4.4 根因修复：必须校验 HIWORD=BN_CLICKED 才是按钮点击。
+            // 此前只看 LOWORD（控件 ID）：EDIT 创建时初始文本触发 EN_CHANGE 通知
+            // （LOWORD=ID 2），被误判成"取消"→ DestroyWindow → EDIT 创建失去父窗口
+            // 报 0x80070578 → panic=abort → 进程无提示退出（双击直接闪退）
+            let code = ((wp.0 as u32) >> 16) as u32;
             let id = (wp.0 as u32 & 0xffff) as i32;
-            if id == 1 || id == 2 {
+            if code == BN_CLICKED as u32 && (id == 1 || id == 2) {
                 if id == 1 {
                     // 确定：读取编辑框文本
                     let edit = RENAME_EDIT.load(Ordering::SeqCst);
@@ -1233,15 +1255,35 @@ unsafe extern "system" fn rename_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     }
 }
 
-/// 弹出重命名对话框（模态），返回新标题；取消返回 None
+/// 弹出重命名对话框（模态），返回新标题；取消返回 None。
+/// 外层防重入：对话框已打开时忽略新的双击/菜单项（模态循环仍会分发主窗口消息）
 fn rename_card(owner: HWND, current: &str) -> Option<String> {
+    if RENAME_ACTIVE.swap(true, Ordering::SeqCst) {
+        return None;
+    }
+    let r = rename_card_inner(owner, current);
+    RENAME_ACTIVE.store(false, Ordering::SeqCst);
+    r
+}
+
+/// 重命名对话框实现：任何失败只写 error.log 并优雅返回，绝不 panic（panic=abort 会直接杀死进程）
+fn rename_card_inner(owner: HWND, current: &str) -> Option<String> {
     RENAME_DONE.store(false, Ordering::SeqCst);
     RENAME_ACCEPTED.store(false, Ordering::SeqCst);
     RENAME_VALUE.lock().unwrap().clear();
 
-    let hinst = unsafe { GetModuleHandleW(None).expect("GetModuleHandleW") };
-    let title_w: Vec<u16> = current.encode_utf16().collect();
-    let dlg = unsafe {
+    let hinst = match unsafe { GetModuleHandleW(None) } {
+        Ok(h) => h,
+        Err(e) => {
+            error_log(&format!("rename: GetModuleHandleW 失败 {}", e));
+            return None;
+        }
+    };
+    // UTF-16 必须 NUL 终止：此前缺终止符，Win32 按字符串复制会读越过缓冲区，
+    // 导致 EDIT 创建报 0x80070578（无效的窗口句柄）——v0.4.4 根因
+    let mut title_w: Vec<u16> = current.encode_utf16().collect();
+    title_w.push(0);
+    let dlg = match unsafe {
         CreateWindowExW(
             WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
             w!("DeskOrgRenameDlg"),
@@ -1256,34 +1298,53 @@ fn rename_card(owner: HWND, current: &str) -> Option<String> {
             Some(hinst.into()),
             None,
         )
-        .expect("重命名窗口失败")
+    } {
+        Ok(h) => h,
+        Err(e) => {
+            error_log(&format!("rename: 对话框创建失败 {}", e));
+            return None;
+        }
     };
+    if !unsafe { IsWindow(Some(dlg)) }.as_bool() {
+        error_log("rename: 对话框创建后句柄即无效");
+        return None;
+    }
     RENAME_DLG.store(dlg.0 as *mut c_void, Ordering::SeqCst);
 
     // 居中于主窗口
     unsafe {
         let mut rc = RECT::default();
-        GetWindowRect(owner, &mut rc);
+        let _ = GetWindowRect(owner, &mut rc);
         let sw = GetSystemMetrics(SM_CXSCREEN);
         let sh = GetSystemMetrics(SM_CYSCREEN);
         let cx = rc.left + (rc.right - rc.left) / 2 - 160;
         let cy = rc.top + (rc.bottom - rc.top) / 2 - 70;
-        let _ = SetWindowPos(dlg, None, cx.clamp(0, sw - 320), cy.clamp(0, sh - 140), 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+        if let Err(e) = SetWindowPos(dlg, None, cx.clamp(0, sw - 320), cy.clamp(0, sh - 140), 0, 0, SWP_NOSIZE | SWP_NOZORDER) {
+            error_log(&format!("rename: 定位失败 {} IsWindow={}", e, IsWindow(Some(dlg)).as_bool() as u8));
+        }
+    }
+    if !unsafe { IsWindow(Some(dlg)) }.as_bool() {
+        error_log("rename: 定位后对话框句柄失效");
+        return None;
     }
 
-    unsafe {
-        // 标签
-        let _ = CreateWindowExW(
+    // 标签
+    if let Err(e) = unsafe {
+        CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("STATIC"),
             w!("输入分区名称："),
             WS_CHILD | WS_VISIBLE,
             16, 16, 280, 20,
             Some(dlg), Some(HMENU(1usize as *mut c_void)), Some(hinst.into()), None,
-        );
+        )
+    } {
+        error_log(&format!("rename: 标签创建失败 {} IsWindow={}", e, unsafe { IsWindow(Some(dlg)) }.as_bool() as u8));
+        let _ = unsafe { DestroyWindow(dlg) };
+        return None;
     }
     // 输入框（子类化：Enter/Esc）
-    let edit = unsafe {
+    let edit = match unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("EDIT"),
@@ -1292,45 +1353,67 @@ fn rename_card(owner: HWND, current: &str) -> Option<String> {
             16, 44, 280, 26,
             Some(dlg), Some(HMENU(2usize as *mut c_void)), Some(hinst.into()), None,
         )
-        .expect("重命名输入框失败")
+    } {
+        Ok(h) => h,
+        Err(e) => {
+            error_log(&format!("rename: 输入框创建失败 {} IsWindow={}", e, unsafe { IsWindow(Some(dlg)) }.as_bool() as u8));
+            let _ = unsafe { DestroyWindow(dlg) };
+            return None;
+        }
     };
     RENAME_EDIT.store(edit.0 as *mut c_void, Ordering::SeqCst);
     let old_proc = unsafe { SetWindowLongPtrW(edit, GWLP_WNDPROC, rename_edit_proc as isize) };
     RENAME_EDIT_OLD.store(old_proc as *mut c_void, Ordering::SeqCst);
 
-    unsafe {
-        let _ = CreateWindowExW(
+    // 确定 / 取消按钮
+    if let Err(e) = unsafe {
+        CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("BUTTON"),
             w!("确定"),
             WINDOW_STYLE((WS_CHILD | WS_VISIBLE | WS_TABSTOP).0 | BS_DEFPUSHBUTTON as u32),
             168, 86, 64, 28,
             Some(dlg), Some(HMENU(1usize as *mut c_void)), Some(hinst.into()), None,
-        );
-        let _ = CreateWindowExW(
+        )
+    } {
+        error_log(&format!("rename: 确定按钮创建失败 {}", e));
+        let _ = unsafe { DestroyWindow(dlg) };
+        return None;
+    }
+    if let Err(e) = unsafe {
+        CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("BUTTON"),
             w!("取消"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             240, 86, 64, 28,
             Some(dlg), Some(HMENU(2usize as *mut c_void)), Some(hinst.into()), None,
-        );
-        SetFocus(edit);
+        )
+    } {
+        error_log(&format!("rename: 取消按钮创建失败 {}", e));
+        let _ = unsafe { DestroyWindow(dlg) };
+        return None;
     }
+    unsafe { SetFocus(edit) };
 
-    // 模态消息循环：直到对话框销毁
+    // 模态消息循环：直到对话框销毁。
+    // GetMessageW 返回 0=WM_QUIT、-1=错误；此前 -1 经 as_bool() 也判为真，会用无效 MSG 调用 Dispatch
     let mut msg = MSG::default();
     while !RENAME_DONE.load(Ordering::SeqCst) {
-        if unsafe { GetMessageW(&mut msg, None, 0, 0).as_bool() } {
-            unsafe {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        } else {
+        let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+        if r.0 <= 0 {
             break;
+        }
+        unsafe {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
     }
 
+    // 循环经 WM_QUIT/错误退出时对话框可能仍在：销毁避免残留孤儿窗口
+    if unsafe { IsWindow(Some(dlg)) }.as_bool() {
+        let _ = unsafe { DestroyWindow(dlg) };
+    }
     RENAME_DONE.store(false, Ordering::SeqCst);
     RENAME_EDIT.store(std::ptr::null_mut(), Ordering::SeqCst);
     RENAME_EDIT_OLD.store(std::ptr::null_mut(), Ordering::SeqCst);
@@ -1386,14 +1469,29 @@ extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                     };
                     changed = true;
                 } else if y >= 240 && y < 286 {
-                    // 背景色循环切换预设色
-                    state.settings.bg_color = match state.settings.bg_color {
-                        0x262A36 => 0x3A3A4A,
-                        0x3A3A4A => 0x4A3A3A,
-                        0x4A3A3A => 0x3A4A3A,
-                        _ => 0x262A36,
+                    // 背景色：弹出系统颜色选择器（初始色=当前背景色，支持自定义颜色）
+                    let old = state.settings.bg_color; // 0xRRGGBB
+                    let mut custom: [COLORREF; 16] = [COLORREF(0); 16];
+                    let mut cc = CHOOSECOLORW {
+                        lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
+                        hwndOwner: hwnd,
+                        hInstance: HWND(std::ptr::null_mut()),
+                        rgbResult: COLORREF((old & 0xff) | ((old >> 8) & 0xff) << 8 | ((old >> 16) & 0xff) << 16),
+                        lpCustColors: custom.as_mut_ptr(),
+                        Flags: CC_FULLOPEN | CC_RGBINIT,
+                        lCustData: LPARAM(0),
+                        lpfnHook: None,
+                        lpTemplateName: PCWSTR::null(),
                     };
-                    changed = true;
+                    if unsafe { ChooseColorW(&mut cc) }.as_bool() {
+                        // COLORREF(0x00BBGGRR) → 0xRRGGBB
+                        let v = cc.rgbResult.0;
+                        let picked = ((v & 0xff) << 16) | ((v >> 8) & 0xff) << 8 | ((v >> 16) & 0xff);
+                        if picked != state.settings.bg_color {
+                            state.settings.bg_color = picked;
+                            changed = true;
+                        }
+                    }
                 } else if y >= 286 && y < 332 {
                     // 开机自启开关（写/删注册表 Run 键）
                     state.settings.autostart = !state.settings.autostart;
@@ -1401,8 +1499,10 @@ extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                     changed = true;
                 } else if y >= 332 && y < 378 {
                     // 卸载程序：确认后清理并退出
-                    let msg_w: Vec<u16> = "确定要卸载吗？\n将删除：开机自启、数据目录（布局/设置/日志）。\n程序 exe 将在重启系统后自动删除。".encode_utf16().collect();
-                    let cap_w: Vec<u16> = "卸载确认".encode_utf16().collect();
+                    let mut msg_w: Vec<u16> = "确定要卸载吗？\n将删除：开机自启、数据目录（布局/设置/日志）。\n程序 exe 将在重启系统后自动删除。".encode_utf16().collect();
+                    msg_w.push(0); // NUL 终止
+                    let mut cap_w: Vec<u16> = "卸载确认".encode_utf16().collect();
+                    cap_w.push(0);
                     let ret = unsafe {
                         MessageBoxW(
                             Some(hwnd),
@@ -1489,7 +1589,7 @@ fn draw_settings(hwnd: HWND, settings: &settings::Settings) {
             ("自动分类", if settings.auto_classify { "开".into() } else { "关".into() }),
             ("显示格式", if settings.show_icons { "图标".into() } else { "名称".into() }),
             ("卡片大小", match settings.card_cols { 2 => "大".into(), 4 => "小".into(), _ => "中".into() }),
-            ("背景色", format!("#{:06X}", settings.bg_color)),
+            ("背景色", format!("#{:06X} 选颜色", settings.bg_color)),
             ("开机自启", if settings.autostart { "开".into() } else { "关".into() }),
             ("卸载程序", "点击卸载".into()),
         ];
